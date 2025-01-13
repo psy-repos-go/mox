@@ -3,25 +3,74 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto"
+	"crypto/ed25519"
+	cryptorand "crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
-	"net/mail"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/mjl-/sconf"
 
-	"github.com/mjl-/mox/mlog"
+	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/message"
 	"github.com/mjl-/mox/mox-"
+	"github.com/mjl-/mox/sasl"
 	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/smtpclient"
 )
+
+var submitconf struct {
+	LocalHostname                   string           `sconf-doc:"Hosts don't always have an FQDN, set it explicitly, for EHLO."`
+	Host                            string           `sconf-doc:"Host to dial for delivery, e.g. mail.<domain>."`
+	Port                            int              `sconf-doc:"Port to dial for delivery, e.g. 465 for submissions, 587 for submission, or perhaps 25 for smtp."`
+	TLS                             bool             `sconf-doc:"Connect with TLS. Usually for connections to port 465."`
+	STARTTLS                        bool             `sconf-doc:"After starting in plain text, use STARTTLS to enable TLS. For port 587 and 25."`
+	TLSInsecureSkipVerify           bool             `sconf:"optional" sconf-doc:"If true, do not verify the server TLS identity."`
+	Username                        string           `sconf-doc:"For SMTP authentication."`
+	Password                        string           `sconf:"optional" sconf-doc:"For password-based SMTP authentication, e.g. SCRAM-SHA-256-PLUS, CRAM-MD5, PLAIN."`
+	ClientAuthEd25519PrivateKey     string           `sconf:"optional" sconf-doc:"If set, used for TLS client authentication with a certificate. The private key must be a raw-url-base64-encoded ed25519 key. A basic certificate is composed automatically. The server must use the public key of a certificate to identify/verify users."`
+	ClientAuthCertPrivateKeyPEMFile string           `sconf:"optional" sconf-doc:"If set, an absolute path to a PEM file containing both a PKCS#8 unencrypted private key and a certificate. Used for TLS client authentication."`
+	AuthMethod                      string           `sconf-doc:"If set, only attempt this authentication mechanism. E.g. EXTERNAL (for TLS client authentication), SCRAM-SHA-256-PLUS, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-1, CRAM-MD5, PLAIN. If not set, any mutually supported algorithm can be used, in order listed, from most to least secure. It is recommended to specify the strongest authentication mechanism known to be implemented by the server, to prevent mechanism downgrade attacks. Exactly one of Password, ClientAuthEd25519PrivateKey and ClientAuthCertPrivateKeyPEMFile must be set."`
+	From                            string           `sconf-doc:"Address for MAIL FROM in SMTP and From-header in message."`
+	DefaultDestination              string           `sconf:"optional" sconf-doc:"Used when specified address does not contain an @ and may be a local user (eg root)."`
+	RequireTLS                      RequireTLSOption `sconf:"optional" sconf-doc:"If yes, submission server must implement SMTP REQUIRETLS extension, and connection to submission server must use verified TLS. If no, a TLS-Required header with value no is added to the message, allowing fallback to unverified TLS or plain text delivery despite recpient domain policies. By default, the submission server will follow the policies of the recipient domain (MTA-STS and/or DANE), and apply unverified opportunistic TLS with STARTTLS."`
+
+	// For TLS client authentication with a certificate. Either from
+	// ClientAuthEd25519PrivateKey or ClientAuthCertPrivateKeyPEMFile.
+	clientCert *tls.Certificate
+}
+
+type RequireTLSOption string
+
+const (
+	RequireTLSDefault RequireTLSOption = ""
+	RequireTLSYes     RequireTLSOption = "yes"
+	RequireTLSNo      RequireTLSOption = "no"
+)
+
+func cmdConfigDescribeSendmail(c *cmd) {
+	c.params = ">/etc/moxsubmit.conf"
+	c.help = `Describe configuration for mox when invoked as sendmail.`
+	if len(c.Parse()) != 0 {
+		c.Usage()
+	}
+
+	err := sconf.Describe(os.Stdout, submitconf)
+	xcheckf(err, "describe config")
+}
 
 func cmdSendmail(c *cmd) {
 	c.params = "[-Fname] [ignoredflags] [-t] [<message]"
@@ -93,6 +142,71 @@ binary should be setgid that group:
 	err := sconf.ParseFile(confPath, &submitconf)
 	xcheckf(err, "parsing config")
 
+	var secrets []string
+	for _, s := range []string{submitconf.Password, submitconf.ClientAuthEd25519PrivateKey, submitconf.ClientAuthCertPrivateKeyPEMFile} {
+		if s != "" {
+			secrets = append(secrets, s)
+		}
+	}
+	if len(secrets) != 1 {
+		xcheckf(fmt.Errorf("got passwords/keys %s, need exactly one", strings.Join(secrets, ", ")), "checking passwords/keys")
+	}
+	if submitconf.ClientAuthEd25519PrivateKey != "" {
+		seed, err := base64.RawURLEncoding.DecodeString(submitconf.ClientAuthEd25519PrivateKey)
+		xcheckf(err, "parsing ed25519 private key")
+		if len(seed) != ed25519.SeedSize {
+			xcheckf(fmt.Errorf("got %d bytes, need %d", len(seed), ed25519.SeedSize), "parsing ed25519 private key")
+		}
+		privKey := ed25519.NewKeyFromSeed(seed)
+		_, cert := xminimalCert(privKey)
+		submitconf.clientCert = &cert
+	} else if submitconf.ClientAuthCertPrivateKeyPEMFile != "" {
+		pemBuf, err := os.ReadFile(submitconf.ClientAuthCertPrivateKeyPEMFile)
+		xcheckf(err, "reading pem file")
+		var cert tls.Certificate
+		for {
+			block, rest := pem.Decode(pemBuf)
+			if block == nil && len(rest) != 0 {
+				log.Printf("xxx, leftover data %q", rest)
+				log.Fatalf("leftover data in pem file")
+			} else if block == nil {
+				break
+			}
+			switch block.Type {
+			case "CERTIFICATE":
+				c, err := x509.ParseCertificate(block.Bytes)
+				xcheckf(err, "parsing certificate")
+				if cert.Leaf == nil {
+					cert.Leaf = c
+				}
+				cert.Certificate = append(cert.Certificate, block.Bytes)
+			case "PRIVATE KEY":
+				if cert.PrivateKey != nil {
+					log.Fatalf("cannot handle multiple private keys")
+				}
+				privKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+				xcheckf(err, "parsing private key")
+				cert.PrivateKey = privKey
+			default:
+				log.Fatalf("unrecognized pem type %q, only CERTIFICATE and PRIVATE KEY allowed", block.Type)
+			}
+			pemBuf = rest
+		}
+		if len(cert.Certificate) == 0 {
+			log.Fatalf("no certificate(s) found in pem file")
+		}
+		if cert.PrivateKey == nil {
+			log.Fatalf("no private key found in pem file")
+		}
+		type cryptoPublicKey interface {
+			Equal(x crypto.PublicKey) bool
+		}
+		if !cert.PrivateKey.(crypto.Signer).Public().(cryptoPublicKey).Equal(cert.Leaf.PublicKey) {
+			log.Fatalf("certificate public key does not match with private key")
+		}
+		submitconf.clientCert = &cert
+	}
+
 	var recipient string
 	if len(args) == 1 && !tflag {
 		recipient = args[0]
@@ -134,6 +248,9 @@ binary should be setgid that group:
 				if !haveTo {
 					line = fmt.Sprintf("To: <%s>\r\n", recipient) + line
 				}
+				if submitconf.RequireTLS == RequireTLSNo {
+					line = "TLS-Required: No\r\n" + line
+				}
 				header = false
 			} else if header {
 				t := strings.SplitN(line, ":", 2)
@@ -158,12 +275,12 @@ binary should be setgid that group:
 						}
 						recipient = submitconf.DefaultDestination
 					} else {
-						addrs, err := mail.ParseAddressList(s)
+						addrs, err := message.ParseAddressList(s)
 						xcheckf(err, "parsing To address list")
 						if len(addrs) != 1 {
 							log.Fatalf("only single address allowed in To header")
 						}
-						recipient = addrs[0].Address
+						recipient = addrs[0].User + "@" + addrs[0].Host
 					}
 				}
 				if k == "to" {
@@ -176,6 +293,9 @@ binary should be setgid that group:
 			break
 		}
 	}
+	if header && submitconf.RequireTLS == RequireTLSNo {
+		sb.WriteString("TLS-Required: No\r\n")
+	}
 	msg := sb.String()
 
 	if recipient == "" {
@@ -184,8 +304,9 @@ binary should be setgid that group:
 
 	// Message seems acceptable. We'll try to deliver it from here. If that fails, we
 	// store the message in the users home directory.
+	// Must only use xsavecheckf for error checking in the code below.
 
-	xcheckf := func(err error, format string, args ...any) {
+	xsavecheckf := func(err error, format string, args ...any) {
 		if err == nil {
 			return
 		}
@@ -196,13 +317,7 @@ binary should be setgid that group:
 		os.Mkdir(maildir, 0700)
 		f, err := os.CreateTemp(maildir, "newmsg.")
 		xcheckf(err, "creating temp file for storing message after failed delivery")
-		defer func() {
-			if f != nil {
-				if err := os.Remove(f.Name()); err != nil {
-					log.Printf("removing temp file after failure storing failed delivery: %v", err)
-				}
-			}
-		}()
+		// note: not removing the partial file if writing/closing below fails.
 		_, err = f.Write([]byte(msg))
 		xcheckf(err, "writing message to temp file after failed delivery")
 		name := f.Name()
@@ -213,32 +328,112 @@ binary should be setgid that group:
 		os.Exit(1)
 	}
 
-	var conn net.Conn
 	addr := net.JoinHostPort(submitconf.Host, fmt.Sprintf("%d", submitconf.Port))
 	d := net.Dialer{Timeout: 30 * time.Second}
-	if submitconf.TLS {
-		conn, err = tls.DialWithDialer(&d, "tcp", addr, nil)
-	} else {
-		conn, err = d.Dial("tcp", addr)
+	conn, err := d.Dial("tcp", addr)
+	xsavecheckf(err, "dial submit server")
+
+	auth := func(mechanisms []string, cs *tls.ConnectionState) (sasl.Client, error) {
+		// Check explicitly configured mechanisms.
+		switch submitconf.AuthMethod {
+		case "EXTERNAL":
+			return sasl.NewClientExternal(submitconf.Username), nil
+		case "SCRAM-SHA-256-PLUS":
+			if cs == nil {
+				return nil, fmt.Errorf("scram plus authentication mechanism requires tls")
+			}
+			return sasl.NewClientSCRAMSHA256PLUS(submitconf.Username, submitconf.Password, *cs), nil
+		case "SCRAM-SHA-256":
+			return sasl.NewClientSCRAMSHA256(submitconf.Username, submitconf.Password, false), nil
+		case "SCRAM-SHA-1-PLUS":
+			if cs == nil {
+				return nil, fmt.Errorf("scram plus authentication mechanism requires tls")
+			}
+			return sasl.NewClientSCRAMSHA1PLUS(submitconf.Username, submitconf.Password, *cs), nil
+		case "SCRAM-SHA-1":
+			return sasl.NewClientSCRAMSHA1(submitconf.Username, submitconf.Password, false), nil
+		case "CRAM-MD5":
+			return sasl.NewClientCRAMMD5(submitconf.Username, submitconf.Password), nil
+		case "PLAIN":
+			return sasl.NewClientPlain(submitconf.Username, submitconf.Password), nil
+		}
+
+		// Try the defaults, from more to less secure.
+		if cs != nil && submitconf.clientCert != nil {
+			return sasl.NewClientExternal(submitconf.Username), nil
+		} else if cs != nil && slices.Contains(mechanisms, "SCRAM-SHA-256-PLUS") {
+			return sasl.NewClientSCRAMSHA256PLUS(submitconf.Username, submitconf.Password, *cs), nil
+		} else if slices.Contains(mechanisms, "SCRAM-SHA-256") {
+			return sasl.NewClientSCRAMSHA256(submitconf.Username, submitconf.Password, true), nil
+		} else if cs != nil && slices.Contains(mechanisms, "SCRAM-SHA-1-PLUS") {
+			return sasl.NewClientSCRAMSHA1PLUS(submitconf.Username, submitconf.Password, *cs), nil
+		} else if slices.Contains(mechanisms, "SCRAM-SHA-1") {
+			return sasl.NewClientSCRAMSHA1(submitconf.Username, submitconf.Password, true), nil
+		} else if slices.Contains(mechanisms, "CRAM-MD5") {
+			return sasl.NewClientCRAMMD5(submitconf.Username, submitconf.Password), nil
+		} else if slices.Contains(mechanisms, "PLAIN") {
+			return sasl.NewClientPlain(submitconf.Username, submitconf.Password), nil
+		}
+		// No mutually supported mechanism.
+		return nil, nil
 	}
-	xcheckf(err, "dial submit server")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	tlsMode := smtpclient.TLSStrict
-	if !submitconf.STARTTLS {
-		tlsMode = smtpclient.TLSSkip
+	tlsMode := smtpclient.TLSSkip
+	tlsPKIX := false
+	if submitconf.TLS {
+		tlsMode = smtpclient.TLSImmediate
+		tlsPKIX = true
+	} else if submitconf.STARTTLS {
+		tlsMode = smtpclient.TLSRequiredStartTLS
+		tlsPKIX = true
+	} else if submitconf.RequireTLS == RequireTLSYes {
+		xsavecheckf(errors.New("cannot submit with requiretls enabled without tls to submission server"), "checking tls configuration")
 	}
-	// todo: should have more auth options, scram-sha-256 at least, perhaps cram-md5 for compatibility as well.
-	authLine := fmt.Sprintf("AUTH PLAIN %s", base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("\u0000%s\u0000%s", submitconf.Username, submitconf.Password))))
-	mox.Conf.Static.HostnameDomain.ASCII = submitconf.LocalHostname
-	client, err := smtpclient.New(ctx, mlog.New("sendmail"), conn, tlsMode, submitconf.Host, authLine)
-	xcheckf(err, "open smtp session")
+	if submitconf.TLSInsecureSkipVerify {
+		tlsPKIX = false
+	}
 
-	err = client.Deliver(ctx, submitconf.From, recipient, int64(len(msg)), strings.NewReader(msg), true, false)
-	xcheckf(err, "submit message")
+	ourHostname, err := dns.ParseDomain(submitconf.LocalHostname)
+	xsavecheckf(err, "parsing our local hostname")
+
+	var remoteHostname dns.Domain
+	if net.ParseIP(submitconf.Host) == nil {
+		remoteHostname, err = dns.ParseDomain(submitconf.Host)
+		xsavecheckf(err, "parsing remote hostname")
+	}
+
+	// todo: implement SRV and DANE, allowing for a simpler config file (just the email address & password)
+	opts := smtpclient.Opts{
+		Auth:       auth,
+		RootCAs:    mox.Conf.Static.TLS.CertPool,
+		ClientCert: submitconf.clientCert,
+	}
+	client, err := smtpclient.New(ctx, c.log.Logger, conn, tlsMode, tlsPKIX, ourHostname, remoteHostname, opts)
+	xsavecheckf(err, "open smtp session")
+
+	err = client.Deliver(ctx, submitconf.From, recipient, int64(len(msg)), strings.NewReader(msg), true, false, submitconf.RequireTLS == RequireTLSYes)
+	xsavecheckf(err, "submit message")
 
 	if err := client.Close(); err != nil {
 		log.Printf("closing smtp session after message was sent: %v", err)
 	}
+}
+
+func xminimalCert(privKey ed25519.PrivateKey) ([]byte, tls.Certificate) {
+	template := &x509.Certificate{
+		// Required field.
+		SerialNumber: big.NewInt(time.Now().Unix()),
+	}
+	certBuf, err := x509.CreateCertificate(cryptorand.Reader, template, template, privKey.Public(), privKey)
+	xcheckf(err, "creating minimal certificate")
+	cert, err := x509.ParseCertificate(certBuf)
+	xcheckf(err, "parsing certificate")
+	c := tls.Certificate{
+		Certificate: [][]byte{certBuf},
+		PrivateKey:  privKey,
+		Leaf:        cert,
+	}
+	return certBuf, c
 }

@@ -19,37 +19,41 @@ func TestExport(t *testing.T) {
 	// Set up an account, add 2 messages to different 2 mailboxes. export as tar/zip
 	// and maildir/mbox. check there are 2 files in the repo, no errors.txt.
 
+	log := mlog.New("export", nil)
+
 	os.RemoveAll("../testdata/store/data")
-	mox.ConfigStaticPath = "../testdata/store/mox.conf"
-	mox.MustLoadConfig(false)
-	acc, err := OpenAccount("mjl")
+	mox.ConfigStaticPath = filepath.FromSlash("../testdata/store/mox.conf")
+	mox.MustLoadConfig(true, false)
+	acc, err := OpenAccount(pkglog, "mjl")
 	tcheck(t, err, "open account")
-	defer acc.Close()
-	switchDone := Switchboard()
-	defer close(switchDone)
+	defer func() {
+		err := acc.Close()
+		log.Check(err, "closing account")
+		acc.CheckClosed()
+	}()
+	defer Switchboard()()
 
-	log := mlog.New("export")
-
-	msgFile, err := os.CreateTemp("", "mox-test-export")
+	msgFile, err := CreateMessageTemp(pkglog, "mox-test-export")
 	tcheck(t, err, "create temp")
 	defer os.Remove(msgFile.Name()) // To be sure.
+	defer msgFile.Close()
 	const msg = "test: test\r\n\r\ntest\r\n"
 	_, err = msgFile.Write([]byte(msg))
 	tcheck(t, err, "write message")
 
 	m := Message{Received: time.Now(), Size: int64(len(msg))}
-	err = acc.DeliverMailbox(xlog, "Inbox", &m, msgFile, false)
+	err = acc.DeliverMailbox(pkglog, "Inbox", &m, msgFile)
 	tcheck(t, err, "deliver")
 
 	m = Message{Received: time.Now(), Size: int64(len(msg))}
-	err = acc.DeliverMailbox(xlog, "Trash", &m, msgFile, true)
+	err = acc.DeliverMailbox(pkglog, "Trash", &m, msgFile)
 	tcheck(t, err, "deliver")
 
 	var maildirZip, maildirTar, mboxZip, mboxTar bytes.Buffer
 
 	archive := func(archiver Archiver, maildir bool) {
 		t.Helper()
-		err = ExportMessages(ctxbg, log, acc.DB, acc.Dir, archiver, maildir, "")
+		err = ExportMessages(ctxbg, log, acc.DB, acc.Dir, archiver, maildir, "", true)
 		tcheck(t, err, "export messages")
 		err = archiver.Close()
 		tcheck(t, err, "archiver close")
@@ -62,19 +66,20 @@ func TestExport(t *testing.T) {
 	archive(ZipArchiver{zip.NewWriter(&mboxZip)}, false)
 	archive(TarArchiver{tar.NewWriter(&maildirTar)}, true)
 	archive(TarArchiver{tar.NewWriter(&mboxTar)}, false)
-	archive(DirArchiver{"../testdata/exportmaildir"}, true)
-	archive(DirArchiver{"../testdata/exportmbox"}, false)
+	archive(DirArchiver{filepath.FromSlash("../testdata/exportmaildir")}, true)
+	archive(DirArchiver{filepath.FromSlash("../testdata/exportmbox")}, false)
 
+	const defaultMailboxes = 6 // Inbox, Drafts, etc
 	if r, err := zip.NewReader(bytes.NewReader(maildirZip.Bytes()), int64(maildirZip.Len())); err != nil {
 		t.Fatalf("reading maildir zip: %v", err)
-	} else if len(r.File) != 2*3+2 {
-		t.Fatalf("maildir zip, expected 2*3 dirs, and 2 files, got %d files", len(r.File))
+	} else if len(r.File) != defaultMailboxes*3+2 {
+		t.Fatalf("maildir zip, expected %d*3 dirs, and 2 files, got %d files", defaultMailboxes, len(r.File))
 	}
 
 	if r, err := zip.NewReader(bytes.NewReader(mboxZip.Bytes()), int64(mboxZip.Len())); err != nil {
 		t.Fatalf("reading mbox zip: %v", err)
-	} else if len(r.File) != 2 {
-		t.Fatalf("maildir zip, 2 files, got %d files", len(r.File))
+	} else if len(r.File) != defaultMailboxes {
+		t.Fatalf("maildir zip, expected %d files, got %d files", defaultMailboxes, len(r.File))
 	}
 
 	checkTarFiles := func(r io.Reader, n int) {
@@ -98,8 +103,8 @@ func TestExport(t *testing.T) {
 		}
 	}
 
-	checkTarFiles(&maildirTar, 2*3+2)
-	checkTarFiles(&mboxTar, 2)
+	checkTarFiles(&maildirTar, defaultMailboxes*3+2)
+	checkTarFiles(&mboxTar, defaultMailboxes)
 
 	checkDirFiles := func(dir string, n int) {
 		t.Helper()
@@ -116,6 +121,6 @@ func TestExport(t *testing.T) {
 		}
 	}
 
-	checkDirFiles("../testdata/exportmaildir", 2)
-	checkDirFiles("../testdata/exportmbox", 2)
+	checkDirFiles(filepath.FromSlash("../testdata/exportmaildir"), 2)
+	checkDirFiles(filepath.FromSlash("../testdata/exportmbox"), defaultMailboxes)
 }

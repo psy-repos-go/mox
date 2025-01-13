@@ -11,7 +11,7 @@ func TestListBasic(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
 
-	tc.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
 
 	ulist := func(name string, flags ...string) imapclient.UntaggedList {
 		if len(flags) == 0 {
@@ -27,13 +27,13 @@ func TestListBasic(t *testing.T) {
 	tc.xuntagged(ulist("Inbox"))
 
 	tc.last(tc.client.List("%"))
-	tc.xuntagged(ulist("Archive"), ulist("Drafts"), ulist("Inbox"), ulist("Junk"), ulist("Sent"), ulist("Trash"))
+	tc.xuntagged(ulist("Archive", `\Archive`), ulist("Drafts", `\Drafts`), ulist("Inbox"), ulist("Junk", `\Junk`), ulist("Sent", `\Sent`), ulist("Trash", `\Trash`))
 
 	tc.last(tc.client.List("*"))
-	tc.xuntagged(ulist("Archive"), ulist("Drafts"), ulist("Inbox"), ulist("Junk"), ulist("Sent"), ulist("Trash"))
+	tc.xuntagged(ulist("Archive", `\Archive`), ulist("Drafts", `\Drafts`), ulist("Inbox"), ulist("Junk", `\Junk`), ulist("Sent", `\Sent`), ulist("Trash", `\Trash`))
 
 	tc.last(tc.client.List("A*"))
-	tc.xuntagged(ulist("Archive"))
+	tc.xuntagged(ulist("Archive", `\Archive`))
 
 	tc.client.Create("Inbox/todo")
 
@@ -61,7 +61,7 @@ func TestListExtended(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
 
-	tc.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
 
 	ulist := func(name string, flags ...string) imapclient.UntaggedList {
 		if len(flags) == 0 {
@@ -71,7 +71,11 @@ func TestListExtended(t *testing.T) {
 	}
 
 	uidvals := map[string]uint32{}
-	for _, name := range store.InitialMailboxes {
+	use := store.DefaultInitialMailboxes.SpecialUse
+	for _, name := range []string{"Inbox", use.Archive, use.Draft, use.Junk, use.Sent, use.Trash} {
+		uidvals[name] = 1
+	}
+	for _, name := range store.DefaultInitialMailboxes.Regular {
 		uidvals[name] = 1
 	}
 	var uidvalnext uint32 = 2
@@ -86,15 +90,15 @@ func TestListExtended(t *testing.T) {
 	}
 
 	ustatus := func(name string) imapclient.UntaggedStatus {
-		attrs := map[string]int64{
-			"MESSAGES":    0,
-			"UIDNEXT":     1,
-			"UIDVALIDITY": int64(uidval(name)),
-			"UNSEEN":      0,
-			"DELETED":     0,
-			"SIZE":        0,
-			"RECENT":      0,
-			"APPENDLIMIT": 0,
+		attrs := map[imapclient.StatusAttr]int64{
+			imapclient.StatusMessages:    0,
+			imapclient.StatusUIDNext:     1,
+			imapclient.StatusUIDValidity: int64(uidval(name)),
+			imapclient.StatusUnseen:      0,
+			imapclient.StatusDeleted:     0,
+			imapclient.StatusSize:        0,
+			imapclient.StatusRecent:      0,
+			imapclient.StatusAppendLimit: 0,
 		}
 		return imapclient.UntaggedStatus{Mailbox: name, Attrs: attrs}
 	}
@@ -105,7 +109,7 @@ func TestListExtended(t *testing.T) {
 		Fhasnochildren = `\HasNoChildren`
 		Fnonexistent   = `\NonExistent`
 		Farchive       = `\Archive`
-		Fdraft         = `\Draft`
+		Fdraft         = `\Drafts`
 		Fjunk          = `\Junk`
 		Fsent          = `\Sent`
 		Ftrash         = `\Trash`

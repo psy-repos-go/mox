@@ -7,17 +7,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/mjl-/mox/mlog"
 )
 
 var (
-	listWildcards = "%*"
-	char          = charRange('\x01', '\x7f')
-	ctl           = charRange('\x01', '\x19')
-	atomChar      = charRemove(char, "(){ "+listWildcards+ctl)
-	respSpecials  = atomChar + "]"
-	astringChar   = atomChar + respSpecials
+	listWildcards  = "%*"
+	char           = charRange('\x01', '\x7f')
+	ctl            = charRange('\x01', '\x19')
+	quotedSpecials = `"\`
+	respSpecials   = "]"
+	atomChar       = charRemove(char, "(){ "+ctl+listWildcards+quotedSpecials+respSpecials)
+	astringChar    = atomChar + respSpecials
 )
 
 func charRange(first, last rune) string {
@@ -49,11 +48,13 @@ type parser struct {
 	// Orig is the line in original casing, and upper in upper casing. We often match
 	// against upper for easy case insensitive handling as IMAP requires, but sometimes
 	// return from orig to keep the original case.
-	orig     string
-	upper    string
-	o        int      // Current offset in parsing.
-	contexts []string // What we're parsing, for error messages.
-	conn     *conn
+	orig        string
+	upper       string
+	o           int      // Current offset in parsing.
+	contexts    []string // What we're parsing, for error messages.
+	literals    int      // Literals in command, for limit.
+	literalSize int64    // Total size of literals in command, for limit.
+	conn        *conn
 }
 
 // toUpper upper cases bytes that are a-z. strings.ToUpper does too much. and
@@ -71,7 +72,7 @@ func toUpper(s string) string {
 }
 
 func newParser(s string, conn *conn) *parser {
-	return &parser{s, toUpper(s), 0, nil, conn}
+	return &parser{s, toUpper(s), 0, nil, 0, 0, conn}
 }
 
 func (p *parser) xerrorf(format string, args ...any) {
@@ -122,7 +123,7 @@ func (p *parser) take(s string) bool {
 
 func (p *parser) xtake(s string) {
 	if !p.take(s) {
-		p.xerrorf("expected %q", s)
+		p.xerrorf("expected %s", s)
 	}
 }
 
@@ -145,23 +146,6 @@ func (p *parser) xtake1n(n int, what string) string {
 	return p.xtaken(n)
 }
 
-func (p *parser) xtake1fn(fn func(i int, c rune) bool) string {
-	i := 0
-	s := ""
-	for _, c := range p.upper[p.o:] {
-		if !fn(i, c) {
-			break
-		}
-		s += string(c)
-		i++
-	}
-	if s == "" {
-		p.xerrorf("expected at least one character")
-	}
-	p.o += len(s)
-	return s
-}
-
 func (p *parser) xtakechars(s string, what string) string {
 	p.xnonempty()
 	for i, c := range p.orig[p.o:] {
@@ -181,13 +165,6 @@ func (p *parser) xtaken(n int) string {
 	return r
 }
 
-func (p *parser) peekn(n int) (string, bool) {
-	if len(p.upper[p.o:]) < n {
-		return "", false
-	}
-	return p.upper[p.o : p.o+n], true
-}
-
 func (p *parser) space() bool {
 	return p.take(" ")
 }
@@ -201,9 +178,10 @@ func (p *parser) xspace() {
 func (p *parser) digits() string {
 	var n int
 	for _, c := range p.upper[p.o:] {
-		if c >= '0' && c <= '9' {
-			n++
+		if c < '0' || c > '9' {
+			break
 		}
+		n++
 	}
 	if n == 0 {
 		return ""
@@ -268,9 +246,17 @@ func (p *parser) xnumber64() int64 {
 	if s == "" {
 		p.xerrorf("expected number64")
 	}
-	v, err := strconv.ParseInt(s, 10, 64)
+	v, err := strconv.ParseInt(s, 10, 63) // ../rfc/9051:6794 ../rfc/7162:297
 	if err != nil {
 		p.xerrorf("parsing number64 %q: %v", s, err)
+	}
+	return v
+}
+
+func (p *parser) xnznumber64() int64 {
+	v := p.xnumber64()
+	if v == 0 {
+		p.xerrorf("expected non-zero number64")
 	}
 	return v
 }
@@ -318,7 +304,7 @@ func (p *parser) xstring() (r string) {
 		}
 		p.xerrorf("missing closing dquote in string")
 	}
-	size, sync := p.xliteralSize(100*1024, false)
+	size, sync := p.xliteralSize(false, true)
 	s := p.conn.xreadliteral(size, sync)
 	line := p.conn.readline(false)
 	p.orig, p.upper, p.o = line, toUpper(line), 0
@@ -376,8 +362,18 @@ func (p *parser) remainder() string {
 	return p.orig[p.o:]
 }
 
+// ../rfc/9051:6565
 func (p *parser) xflag() string {
-	return p.xtakelist(`\`, "$") + p.xatom()
+	w, _ := p.takelist(`\`, "$")
+	s := w + p.xatom()
+	if s[0] == '\\' {
+		switch strings.ToLower(s) {
+		case `\answered`, `\flagged`, `\deleted`, `\seen`, `\draft`:
+		default:
+			p.xerrorf("unknown system flag %s", s)
+		}
+	}
+	return s
 }
 
 func (p *parser) xflagList() (l []string) {
@@ -396,30 +392,37 @@ func (p *parser) xatom() string {
 	return p.xtakechars(atomChar, "atom")
 }
 
+func (p *parser) xdecodeMailbox(s string) string {
+	// UTF-7 is deprecated for IMAP4rev2-only clients, and not used with UTF8=ACCEPT.
+	// The future should be without UTF-7, we don't encode/decode it with modern
+	// clients. Most clients are IMAP4rev1, we need to handle UTF-7.
+	// ../rfc/3501:964 ../rfc/9051:7885
+	// Thunderbird will enable UTF8=ACCEPT and send "&" unencoded. ../rfc/9051:7953
+	if p.conn.utf8strings() {
+		return s
+	}
+	ns, err := utf7decode(s)
+	if err != nil {
+		p.xerrorf("decoding utf7 mailbox name: %v", err)
+	}
+	return ns
+}
+
 func (p *parser) xmailbox() string {
 	s := p.xastring()
-	// UTF-7 is deprecated in IMAP4rev2. IMAP4rev1 does not fully forbid
-	// UTF-8 returned in mailbox names. We'll do our best by attempting to
-	// decode utf-7. But if that doesn't work, we'll just use the original
-	// string.
-	// ../rfc/3501:964
-	if !p.conn.enabled[capIMAP4rev2] {
-		ns, err := utf7decode(s)
-		if err != nil {
-			p.conn.log.Infox("decoding utf7 or mailbox name", err, mlog.Field("name", s))
-		} else {
-			s = ns
-		}
-	}
-	return s
+	return p.xdecodeMailbox(s)
 }
 
 // ../rfc/9051:6605
 func (p *parser) xlistMailbox() string {
+	var s string
 	if p.hasPrefix(`"`) || p.hasPrefix("{") {
-		return p.xstring()
+		s = p.xstring()
+	} else {
+		s = p.xtakechars(atomChar+listWildcards+respSpecials, "list-char")
 	}
-	return p.xtakechars(atomChar+listWildcards+respSpecials, "list-char")
+	// Presumably UTF-7 encoding applies to mailbox patterns too.
+	return p.xdecodeMailbox(s)
 }
 
 // ../rfc/9051:6707 ../rfc/9051:6848 ../rfc/5258:1095 ../rfc/5258:1169 ../rfc/5258:1196
@@ -435,36 +438,43 @@ func (p *parser) xmboxOrPat() ([]string, bool) {
 	return l, true
 }
 
-// ../rfc/9051:7056
-// RECENT only in ../rfc/3501:5047
-// APPENDLIMIT is from ../rfc/7889:252
+// ../rfc/9051:7056, RECENT ../rfc/3501:5047, APPENDLIMIT ../rfc/7889:252, HIGHESTMODSEQ ../rfc/7162:2452, DELETED-STORAGE ../rfc/9208:696
 func (p *parser) xstatusAtt() string {
-	return p.xtakelist("MESSAGES", "UIDNEXT", "UIDVALIDITY", "UNSEEN", "DELETED", "SIZE", "RECENT", "APPENDLIMIT")
+	w := p.xtakelist("MESSAGES", "UIDNEXT", "UIDVALIDITY", "UNSEEN", "DELETED-STORAGE", "DELETED", "SIZE", "RECENT", "APPENDLIMIT", "HIGHESTMODSEQ")
+	if w == "HIGHESTMODSEQ" {
+		// HIGHESTMODSEQ is a CONDSTORE-enabling parameter. ../rfc/7162:375
+		p.conn.enabled[capCondstore] = true
+	}
+	return w
 }
 
 // ../rfc/9051:7133 ../rfc/9051:7034
-func (p *parser) xnumSet() (r numSet) {
+func (p *parser) xnumSet0(allowStar, allowSearch bool) (r numSet) {
 	defer p.context("numSet")()
-	if p.take("$") {
+	if allowSearch && p.take("$") {
 		return numSet{searchResult: true}
 	}
-	r.ranges = append(r.ranges, p.xnumRange())
+	r.ranges = append(r.ranges, p.xnumRange0(allowStar))
 	for p.take(",") {
-		r.ranges = append(r.ranges, p.xnumRange())
+		r.ranges = append(r.ranges, p.xnumRange0(allowStar))
 	}
 	return r
 }
 
+func (p *parser) xnumSet() (r numSet) {
+	return p.xnumSet0(true, true)
+}
+
 // parse numRange, which can be just a setNumber.
-func (p *parser) xnumRange() (r numRange) {
-	if p.take("*") {
+func (p *parser) xnumRange0(allowStar bool) (r numRange) {
+	if allowStar && p.take("*") {
 		r.first.star = true
 	} else {
 		r.first.number = p.xnznumber()
 	}
 	if p.take(":") {
 		r.last = &setNumber{}
-		if p.take("*") {
+		if allowStar && p.take("*") {
 			r.last.star = true
 		} else {
 			r.last.number = p.xnznumber()
@@ -562,14 +572,16 @@ func (p *parser) xsectionBinary() (r []uint32) {
 	return r
 }
 
-// ../rfc/9051:6557 ../rfc/3501:4751
-func (p *parser) xfetchAtt() (r fetchAtt) {
+var fetchAttWords = []string{
+	"ENVELOPE", "FLAGS", "INTERNALDATE", "RFC822.SIZE", "BODYSTRUCTURE", "UID", "BODY.PEEK", "BODY", "BINARY.PEEK", "BINARY.SIZE", "BINARY",
+	"RFC822.HEADER", "RFC822.TEXT", "RFC822", // older IMAP
+	"MODSEQ", // CONDSTORE extension.
+}
+
+// ../rfc/9051:6557 ../rfc/3501:4751 ../rfc/7162:2483
+func (p *parser) xfetchAtt(isUID bool) (r fetchAtt) {
 	defer p.context("fetchAtt")()
-	words := []string{
-		"ENVELOPE", "FLAGS", "INTERNALDATE", "RFC822.SIZE", "BODYSTRUCTURE", "UID", "BODY.PEEK", "BODY", "BINARY.PEEK", "BINARY.SIZE", "BINARY",
-		"RFC822.HEADER", "RFC822.TEXT", "RFC822", // older IMAP
-	}
-	f := p.xtakelist(words...)
+	f := p.xtakelist(fetchAttWords...)
 	r.peek = strings.HasSuffix(f, ".PEEK")
 	r.field = strings.TrimSuffix(f, ".PEEK")
 
@@ -588,12 +600,19 @@ func (p *parser) xfetchAtt() (r fetchAtt) {
 		}
 	case "BINARY.SIZE":
 		r.sectionBinary = p.xsectionBinary()
+	case "MODSEQ":
+		// The RFC text mentions MODSEQ is only for FETCH, not UID FETCH, but the ABNF adds
+		// the attribute to the shared syntax, so UID FETCH also implements it.
+		// ../rfc/7162:905
+		// The wording about when to respond with a MODSEQ attribute could be more clear. ../rfc/7162:923 ../rfc/7162:388
+		// MODSEQ attribute is a CONDSTORE-enabling parameter. ../rfc/7162:377
+		p.conn.xensureCondstore(nil)
 	}
 	return
 }
 
 // ../rfc/9051:6553 ../rfc/3501:4748
-func (p *parser) xfetchAtts() []fetchAtt {
+func (p *parser) xfetchAtts(isUID bool) []fetchAtt {
 	defer p.context("fetchAtts")()
 
 	fields := func(l ...string) []fetchAtt {
@@ -617,13 +636,13 @@ func (p *parser) xfetchAtts() []fetchAtt {
 	}
 
 	if !p.hasPrefix("(") {
-		return []fetchAtt{p.xfetchAtt()}
+		return []fetchAtt{p.xfetchAtt(isUID)}
 	}
 
 	l := []fetchAtt{}
 	p.xtake("(")
 	for {
-		l = append(l, p.xfetchAtt())
+		l = append(l, p.xfetchAtt(isUID))
 		if !p.take(" ") {
 			break
 		}
@@ -724,23 +743,47 @@ func (p *parser) xdateTime() time.Time {
 }
 
 // ../rfc/9051:6655 ../rfc/7888:330 ../rfc/3501:4801
-func (p *parser) xliteralSize(maxSize int64, lit8 bool) (size int64, sync bool) {
+func (p *parser) xliteralSize(lit8 bool, checkSize bool) (size int64, sync bool) {
 	// todo: enforce that we get non-binary when ~ isn't present?
 	if lit8 {
 		p.take("~")
 	}
 	p.xtake("{")
 	size = p.xnumber64()
-	if maxSize > 0 && size > maxSize {
-		// ../rfc/7888:249
-		line := fmt.Sprintf("* BYE [ALERT] Max literal size %d is larger than allowed %d in this context", size, maxSize)
-		err := errors.New("literal too big")
-		panic(syntaxError{line, "TOOBIG", err.Error(), err})
-	}
 
 	sync = !p.take("+")
 	p.xtake("}")
 	p.xempty()
+
+	if checkSize {
+		// ../rfc/7888:249
+		var errmsg string
+		const (
+			litSizeMax      = 100 * 1024
+			totalLitSizeMax = 10 * litSizeMax
+			litMax          = 1000
+		)
+		p.literalSize += size
+		p.literals++
+		if size > litSizeMax {
+			errmsg = fmt.Sprintf("max literal size %d is larger than allowed %d", size, litSizeMax)
+		} else if p.literalSize > totalLitSizeMax {
+			errmsg = fmt.Sprintf("max total literal size for command %d is larger than allowed %d", p.literalSize, totalLitSizeMax)
+		} else if p.literals > litMax {
+			errmsg = fmt.Sprintf("max literals for command %d is larger than allowed %d", p.literals, litMax)
+		}
+		if errmsg != "" {
+			// ../rfc/9051:357 ../rfc/3501:347
+			err := errors.New("literal too big: " + errmsg)
+			if sync {
+				errmsg = ""
+			} else {
+				errmsg = "* BYE [ALERT] " + errmsg
+			}
+			panic(syntaxError{errmsg, "TOOBIG", err.Error(), err})
+		}
+	}
+
 	return size, sync
 }
 
@@ -760,9 +803,10 @@ var searchKeyWords = []string{
 	"SENTBEFORE", "SENTON",
 	"SENTSINCE", "SMALLER",
 	"UID", "UNDRAFT",
+	"MODSEQ", // CONDSTORE extension.
 }
 
-// ../rfc/9051:6923 ../rfc/3501:4957
+// ../rfc/9051:6923 ../rfc/3501:4957, MODSEQ ../rfc/7162:2492
 // differences: rfc 9051 removes NEW, OLD, RECENT and makes SMALLER and LARGER number64 instead of number.
 func (p *parser) xsearchKey() *searchKey {
 	if p.take("(") {
@@ -864,10 +908,48 @@ func (p *parser) xsearchKey() *searchKey {
 		p.xspace()
 		sk.uidSet = p.xnumSet()
 	case "UNDRAFT":
+	case "MODSEQ":
+		// ../rfc/7162:1045 ../rfc/7162:2499
+		p.xspace()
+		if p.take(`"`) {
+			// We don't do anything with this field, so parse and ignore.
+			p.xtake(`/FLAGS/`)
+			if p.take(`\`) {
+				p.xtake(`\`) // ../rfc/7162:1072
+			}
+			p.xatom()
+			p.xtake(`"`)
+			p.xspace()
+			p.xtakelist("PRIV", "SHARED", "ALL")
+			p.xspace()
+		}
+		v := p.xnumber64()
+		sk.clientModseq = &v
+		// MODSEQ is a CONDSTORE-enabling parameter. ../rfc/7162:377
+		p.conn.enabled[capCondstore] = true
 	default:
 		p.xerrorf("missing case for op %q", sk.op)
 	}
 	return sk
+}
+
+// hasModseq returns whether there is a modseq filter anywhere in the searchkey.
+func (sk searchKey) hasModseq() bool {
+	if sk.clientModseq != nil {
+		return true
+	}
+	for _, e := range sk.searchKeys {
+		if e.hasModseq() {
+			return true
+		}
+	}
+	if sk.searchKey != nil && sk.searchKey.hasModseq() {
+		return true
+	}
+	if sk.searchKey2 != nil && sk.searchKey2.hasModseq() {
+		return true
+	}
+	return false
 }
 
 // ../rfc/9051:6489 ../rfc/3501:4692
@@ -891,63 +973,4 @@ func (p *parser) xdate() time.Time {
 		p.take(`"`)
 	}
 	return time.Date(year, mon, day, 0, 0, 0, 0, time.UTC)
-}
-
-// ../rfc/9051:7090 ../rfc/4466:716
-func (p *parser) xtaggedExtLabel() string {
-	return p.xtake1fn(func(i int, c rune) bool {
-		return c >= 'A' && c <= 'Z' || c == '-' || c == '_' || c == '.' || i > 0 && (c >= '0' && c <= '9' || c == ':')
-	})
-}
-
-// no return value since we don't currently use the value.
-// ../rfc/9051:7111 ../rfc/4466:749
-func (p *parser) xtaggedExtVal() {
-	if p.take("(") {
-		if p.take(")") {
-			return
-		}
-		p.xtaggedExtComp()
-		p.xtake(")")
-	} else {
-		p.xtaggedExtSimple()
-	}
-}
-
-// ../rfc/9051:7109 ../rfc/4466:747
-func (p *parser) xtaggedExtSimple() {
-	s := p.digits()
-	if s == "" {
-		p.xnumSet()
-	}
-
-	// This can be a number64, or the start of a sequence-set. A sequence-set can also
-	// start with a number, but only an uint32. After the number we'll try to continue
-	// parsing as a sequence-set.
-	_, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		p.xerrorf("parsing int: %v", err)
-	}
-
-	if p.take(":") {
-		if !p.take("*") {
-			p.xnznumber()
-		}
-	}
-	for p.take(",") {
-		p.xnumRange()
-	}
-}
-
-// ../rfc/9051:7111 ../rfc/4466:735
-func (p *parser) xtaggedExtComp() {
-	if p.take("(") {
-		p.xtaggedExtComp()
-		p.xtake(")")
-		return
-	}
-	p.xastring()
-	for p.space() {
-		p.xtaggedExtComp()
-	}
 }

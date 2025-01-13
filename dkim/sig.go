@@ -117,7 +117,7 @@ func (s *Sig) Header() (string, error) {
 			} else if i == len(s.SignedHeaders)-1 {
 				v += ";"
 			}
-			w.Addf(sep, v)
+			w.Addf(sep, "%s", v)
 		}
 	}
 	if len(s.CopiedHeaders) > 0 {
@@ -139,7 +139,7 @@ func (s *Sig) Header() (string, error) {
 			} else if i == len(s.CopiedHeaders)-1 {
 				v += ";"
 			}
-			w.Addf(sep, v)
+			w.Addf(sep, "%s", v)
 		}
 	}
 
@@ -147,7 +147,7 @@ func (s *Sig) Header() (string, error) {
 
 	w.Addf(" ", "b=")
 	if len(s.Signature) > 0 {
-		w.AddWrap([]byte(base64.StdEncoding.EncodeToString(s.Signature)))
+		w.AddWrap([]byte(base64.StdEncoding.EncodeToString(s.Signature)), false)
 	}
 	w.Add("\r\n")
 	return w.String(), nil

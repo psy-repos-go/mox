@@ -1,6 +1,7 @@
 package imapclient
 
 import (
+	"bufio"
 	"fmt"
 	"strings"
 )
@@ -134,6 +135,20 @@ func (c CodeCopyUID) CodeString() string {
 	return fmt.Sprintf("COPYUID %d %s %s", c.DestUIDValidity, str(c.From), str(c.To))
 }
 
+// For CONDSTORE.
+type CodeModified NumSet
+
+func (c CodeModified) CodeString() string {
+	return fmt.Sprintf("MODIFIED %s", NumSet(c).String())
+}
+
+// For CONDSTORE.
+type CodeHighestModSeq int64
+
+func (c CodeHighestModSeq) CodeString() string {
+	return fmt.Sprintf("HIGHESTMODSEQ %d", c)
+}
+
 // RespText represents a response line minus the leading tag.
 type RespText struct {
 	Code    string  // The first word between [] after the status.
@@ -201,10 +216,33 @@ type UntaggedFetch struct {
 	Attrs []FetchAttr
 }
 type UntaggedSearch []uint32
+
+// ../rfc/7162:1101
+type UntaggedSearchModSeq struct {
+	Nums   []uint32
+	ModSeq int64
+}
 type UntaggedStatus struct {
 	Mailbox string
-	Attrs   map[string]int64 // Upper case status attributes. ../rfc/9051:7059
+	Attrs   map[StatusAttr]int64 // Upper case status attributes.
 }
+
+// ../rfc/9051:7059 ../9208:712
+type StatusAttr string
+
+const (
+	StatusMessages       StatusAttr = "MESSAGES"
+	StatusUIDNext        StatusAttr = "UIDNEXT"
+	StatusUIDValidity    StatusAttr = "UIDVALIDITY"
+	StatusUnseen         StatusAttr = "UNSEEN"
+	StatusDeleted        StatusAttr = "DELETED"
+	StatusSize           StatusAttr = "SIZE"
+	StatusRecent         StatusAttr = "RECENT"
+	StatusAppendLimit    StatusAttr = "APPENDLIMIT"
+	StatusHighestModSeq  StatusAttr = "HIGHESTMODSEQ"
+	StatusDeletedStorage StatusAttr = "DELETED-STORAGE"
+)
+
 type UntaggedNamespace struct {
 	Personal, Other, Shared []NamespaceDescr
 }
@@ -224,7 +262,45 @@ type UntaggedEsearch struct {
 	Max        uint32
 	All        NumSet
 	Count      *uint32
+	ModSeq     int64
 	Exts       []EsearchDataExt
+}
+
+// UntaggedVanished is used in QRESYNC to send UIDs that have been removed.
+type UntaggedVanished struct {
+	Earlier bool
+	UIDs    NumSet
+}
+
+// UntaggedQuotaroot lists the roots for which quota can be present.
+type UntaggedQuotaroot []string
+
+// UntaggedQuota holds the quota for a quota root.
+type UntaggedQuota struct {
+	Root string
+
+	// Always has at least one. Any QUOTA=RES-* capability not mentioned has no limit
+	// or this quota root.
+	Resources []QuotaResource
+}
+
+// Resource types ../rfc/9208:533
+
+// QuotaResourceName is the name of a resource type. More can be defined in the
+// future and encountered in the wild. Always in upper case.
+type QuotaResourceName string
+
+const (
+	QuotaResourceStorage           = "STORAGE"
+	QuotaResourceMesssage          = "MESSAGE"
+	QuotaResourceMailbox           = "MAILBOX"
+	QuotaResourceAnnotationStorage = "ANNOTATION-STORAGE"
+)
+
+type QuotaResource struct {
+	Name  QuotaResourceName
+	Usage int64 // Currently in use. Count or disk size in 1024 byte blocks.
+	Limit int64 // Maximum allowed usage.
 }
 
 // ../rfc/2971:184
@@ -276,6 +352,13 @@ func (ns NumSet) String() string {
 		r += x.String()
 	}
 	return r
+}
+
+func ParseNumSet(s string) (ns NumSet, rerr error) {
+	c := Conn{r: bufio.NewReader(strings.NewReader(s))}
+	defer c.recover(&rerr)
+	ns = c.xsequenceSet()
+	return
 }
 
 // NumRange is a single number or range.
@@ -396,21 +479,26 @@ type BodyFields struct {
 	Octets                       int32
 }
 
-// BodyTypeMpart represents the body structure a multipart message, with subparts and the multipart media subtype. Used in a FETCH response.
+// BodyTypeMpart represents the body structure a multipart message, with
+// subparts and the multipart media subtype. Used in a FETCH response.
 type BodyTypeMpart struct {
 	// ../rfc/9051:6411
 	Bodies       []any // BodyTypeBasic, BodyTypeMsg, BodyTypeText
 	MediaSubtype string
+	Ext          *BodyExtensionMpart
 }
 
-// BodyTypeBasic represents basic information about a part, used in a FETCH response.
+// BodyTypeBasic represents basic information about a part, used in a FETCH
+// response.
 type BodyTypeBasic struct {
 	// ../rfc/9051:6407
 	MediaType, MediaSubtype string
 	BodyFields              BodyFields
+	Ext                     *BodyExtension1Part
 }
 
-// BodyTypeMsg represents an email message as a body structure, used in a FETCH response.
+// BodyTypeMsg represents an email message as a body structure, used in a FETCH
+// response.
 type BodyTypeMsg struct {
 	// ../rfc/9051:6415
 	MediaType, MediaSubtype string
@@ -418,14 +506,49 @@ type BodyTypeMsg struct {
 	Envelope                Envelope
 	Bodystructure           any // One of the BodyType*
 	Lines                   int64
+	Ext                     *BodyExtension1Part
 }
 
-// BodyTypeText represents a text part as a body structure, used in a FETCH response.
+// BodyTypeText represents a text part as a body structure, used in a FETCH
+// response.
 type BodyTypeText struct {
 	// ../rfc/9051:6418
 	MediaType, MediaSubtype string
 	BodyFields              BodyFields
 	Lines                   int64
+	Ext                     *BodyExtension1Part
+}
+
+// BodyExtension1Part has the extensible form fields of a BODYSTRUCTURE for
+// multiparts.
+type BodyExtensionMpart struct {
+	// ../rfc/9051:5986 ../rfc/3501:4161 ../rfc/9051:6371 ../rfc/3501:4599
+	Params            [][2]string
+	Disposition       string
+	DispositionParams [][2]string
+	Language          []string
+	Location          string
+	More              []BodyExtension
+}
+
+// BodyExtension1Part has the extensible form fields of a BODYSTRUCTURE for
+// non-multiparts.
+type BodyExtension1Part struct {
+	// ../rfc/9051:6023 ../rfc/3501:4191 ../rfc/9051:6366 ../rfc/3501:4584
+	MD5               string
+	Disposition       string
+	DispositionParams [][2]string
+	Language          []string
+	Location          string
+	More              []BodyExtension
+}
+
+// BodyExtension has the additional extension fields for future expansion of
+// extensions.
+type BodyExtension struct {
+	String *string
+	Number *int64
+	More   []BodyExtension
 }
 
 // "BINARY" fetch response.
@@ -450,3 +573,8 @@ func (f FetchBinarySize) Attr() string { return f.RespAttr }
 type FetchUID uint32
 
 func (f FetchUID) Attr() string { return "UID" }
+
+// "MODSEQ" fetch response.
+type FetchModSeq int64
+
+func (f FetchModSeq) Attr() string { return "MODSEQ" }

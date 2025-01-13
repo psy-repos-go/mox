@@ -1,3 +1,4 @@
+// Package metrics has (prometheus) metrics shared between components of mox, e.g. for authentication.
 package metrics
 
 import (
@@ -12,10 +13,10 @@ var (
 			Help: "Authentication attempts and results.",
 		},
 		[]string{
-			"kind",    // submission, imap, httpaccount, httpadmin
-			"variant", // login, plain, scram-sha-256, scram-sha-1, cram-md5, httpbasic
+			"kind",    // submission, imap, webmail, webapi, webaccount, webadmin (formerly httpaccount, httpadmin)
+			"variant", // login, plain, scram-sha-256, scram-sha-1, cram-md5, weblogin, websessionuse, httpbasic, tlsclientauth.
 			// todo: we currently only use badcreds, but known baduser can be helpful
-			"result", // ok, baduser, badpassword, badcreds, error, aborted
+			"result", // ok, baduser, badpassword, badcreds, badchanbind, error, aborted
 		},
 	)
 

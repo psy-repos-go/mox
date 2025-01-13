@@ -4,12 +4,35 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"fmt"
-	mathrand "math/rand"
+	mathrand2 "math/rand/v2"
+	"sync"
 )
 
-// NewRand returns a new PRNG seeded with random bytes from crypto/rand.
-func NewRand() *mathrand.Rand {
-	return mathrand.New(mathrand.NewSource(CryptoRandInt()))
+type rand struct {
+	rand *mathrand2.Rand
+	sync.Mutex
+}
+
+// NewPseudoRand returns a new PRNG seeded with random bytes from crypto/rand. Its
+// functions can be called concurrently.
+func NewPseudoRand() *rand {
+	var seed [32]byte
+	if _, err := cryptorand.Read(seed[:]); err != nil {
+		panic(err)
+	}
+	return &rand{rand: mathrand2.New(mathrand2.NewChaCha8(seed))}
+}
+
+func (r *rand) Float64() float64 {
+	r.Lock()
+	defer r.Unlock()
+	return r.rand.Float64()
+}
+
+func (r *rand) IntN(n int) int {
+	r.Lock()
+	defer r.Unlock()
+	return r.rand.IntN(n)
 }
 
 // CryptoRandInt returns a cryptographically random number.

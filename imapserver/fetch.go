@@ -7,28 +7,36 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/textproto"
 	"sort"
 	"strings"
 
+	"golang.org/x/exp/maps"
+
 	"github.com/mjl-/bstore"
 
 	"github.com/mjl-/mox/message"
-	"github.com/mjl-/mox/mlog"
+	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/moxio"
 	"github.com/mjl-/mox/store"
 )
 
 // functions to handle fetch attribute requests are defined on fetchCmd.
 type fetchCmd struct {
-	conn          *conn
-	mailboxID     int64
-	uid           store.UID
-	tx            *bstore.Tx     // Writable tx, for storing message when first parsed as mime parts.
-	changes       []store.Change // For updated Seen flag.
-	markSeen      bool
-	needFlags     bool
-	expungeIssued bool // Set if a message cannot be read. Can happen for expunged messages.
+	conn            *conn
+	mailboxID       int64
+	uid             store.UID
+	tx              *bstore.Tx     // Writable tx, for storing message when first parsed as mime parts.
+	changes         []store.Change // For updated Seen flag.
+	markSeen        bool
+	needFlags       bool
+	needModseq      bool                // Whether untagged responses needs modseq.
+	expungeIssued   bool                // Set if a message cannot be read. Can happen for expunged messages.
+	modseq          store.ModSeq        // Initialized on first change, for marking messages as seen.
+	isUID           bool                // If this is a UID FETCH command.
+	hasChangedSince bool                // Whether CHANGEDSINCE was set. Enables MODSEQ in response.
+	deltaCounts     store.MailboxCounts // By marking \Seen, the number of unread/unseen messages will go down. We update counts at the end.
 
 	// Loaded when first needed, closed when message was processed.
 	m    *store.Message // Message currently being processed.
@@ -60,15 +68,61 @@ func (cmd *fetchCmd) xcheckf(err error, format string, args ...any) {
 //
 // State: Selected
 func (c *conn) cmdxFetch(isUID bool, tag, cmdstr string, p *parser) {
-	// Command: ../rfc/9051:4330 ../rfc/3501:2992
-	// Examples: ../rfc/9051:4463 ../rfc/9051:4520
-	// Response syntax: ../rfc/9051:6742 ../rfc/3501:4864
+	// Command: ../rfc/9051:4330 ../rfc/3501:2992 ../rfc/7162:864
+	// Examples: ../rfc/9051:4463 ../rfc/9051:4520 ../rfc/7162:880
+	// Response syntax: ../rfc/9051:6742 ../rfc/3501:4864 ../rfc/7162:2490
 
-	// Request syntax: ../rfc/9051:6553 ../rfc/3501:4748
+	// Request syntax: ../rfc/9051:6553 ../rfc/3501:4748 ../rfc/4466:535 ../rfc/7162:2475
 	p.xspace()
 	nums := p.xnumSet()
 	p.xspace()
-	atts := p.xfetchAtts()
+	atts := p.xfetchAtts(isUID)
+	var changedSince int64
+	var haveChangedSince bool
+	var vanished bool
+	if p.space() {
+		// ../rfc/4466:542
+		// ../rfc/7162:2479
+		p.xtake("(")
+		seen := map[string]bool{}
+		for {
+			var w string
+			if isUID && p.conn.enabled[capQresync] {
+				// Vanished only valid for uid fetch, and only for qresync. ../rfc/7162:1693
+				w = p.xtakelist("CHANGEDSINCE", "VANISHED")
+			} else {
+				w = p.xtakelist("CHANGEDSINCE")
+			}
+			if seen[w] {
+				xsyntaxErrorf("duplicate fetch modifier %s", w)
+			}
+			seen[w] = true
+			switch w {
+			case "CHANGEDSINCE":
+				p.xspace()
+				changedSince = p.xnumber64()
+				// workaround: ios mail (16.5.1) was seen sending changedSince 0 on an existing account that got condstore enabled.
+				if changedSince == 0 && mox.Pedantic {
+					// ../rfc/7162:2551
+					xsyntaxErrorf("changedsince modseq must be > 0")
+				}
+				// CHANGEDSINCE is a CONDSTORE-enabling parameter. ../rfc/7162:380
+				p.conn.xensureCondstore(nil)
+				haveChangedSince = true
+			case "VANISHED":
+				vanished = true
+			}
+			if p.take(")") {
+				break
+			}
+			p.xspace()
+		}
+
+		// ../rfc/7162:1701
+		if vanished && !haveChangedSince {
+			xsyntaxErrorf("VANISHED can only be used with CHANGEDSINCE")
+		}
+	}
 	p.xempty()
 
 	// We don't use c.account.WithRLock because we write to the client while reading messages.
@@ -81,22 +135,115 @@ func (c *conn) cmdxFetch(isUID bool, tag, cmdstr string, p *parser) {
 		runlock()
 	}()
 
-	cmd := &fetchCmd{conn: c, mailboxID: c.mailboxID}
+	var vanishedUIDs []store.UID
+	cmd := &fetchCmd{conn: c, mailboxID: c.mailboxID, isUID: isUID, hasChangedSince: haveChangedSince}
 	c.xdbwrite(func(tx *bstore.Tx) {
 		cmd.tx = tx
 
 		// Ensure the mailbox still exists.
-		c.xmailboxID(tx, c.mailboxID)
+		mb := c.xmailboxID(tx, c.mailboxID)
 
-		uids := c.xnumSetUIDs(isUID, nums)
+		var uids []store.UID
+
+		// With changedSince, the client is likely asking for a small set of changes. Use a
+		// database query to trim down the uids we need to look at.
+		// ../rfc/7162:871
+		if changedSince > 0 {
+			q := bstore.QueryTx[store.Message](tx)
+			q.FilterNonzero(store.Message{MailboxID: c.mailboxID})
+			q.FilterGreater("ModSeq", store.ModSeqFromClient(changedSince))
+			if !vanished {
+				q.FilterEqual("Expunged", false)
+			}
+			err := q.ForEach(func(m store.Message) error {
+				if m.Expunged {
+					vanishedUIDs = append(vanishedUIDs, m.UID)
+				} else if isUID {
+					if nums.containsUID(m.UID, c.uids, c.searchResult) {
+						uids = append(uids, m.UID)
+					}
+				} else {
+					seq := c.sequence(m.UID)
+					if seq > 0 && nums.containsSeq(seq, c.uids, c.searchResult) {
+						uids = append(uids, m.UID)
+					}
+				}
+				return nil
+			})
+			xcheckf(err, "looking up messages with changedsince")
+		} else {
+			uids = c.xnumSetUIDs(isUID, nums)
+		}
+
+		// Send vanished for all missing requested UIDs. ../rfc/7162:1718
+		if vanished {
+			delModSeq, err := c.account.HighestDeletedModSeq(tx)
+			xcheckf(err, "looking up highest deleted modseq")
+			if changedSince < delModSeq.Client() {
+				// First sort the uids we already found, for fast lookup.
+				sort.Slice(vanishedUIDs, func(i, j int) bool {
+					return vanishedUIDs[i] < vanishedUIDs[j]
+				})
+
+				// We'll be gathering any more vanished uids in more.
+				more := map[store.UID]struct{}{}
+				checkVanished := func(uid store.UID) {
+					if uidSearch(c.uids, uid) <= 0 && uidSearch(vanishedUIDs, uid) <= 0 {
+						more[uid] = struct{}{}
+					}
+				}
+				// Now look through the requested uids. We may have a searchResult, handle it
+				// separately from a numset with potential stars, over which we can more easily
+				// iterate.
+				if nums.searchResult {
+					for _, uid := range c.searchResult {
+						checkVanished(uid)
+					}
+				} else {
+					iter := nums.interpretStar(c.uids).newIter()
+					for {
+						num, ok := iter.Next()
+						if !ok {
+							break
+						}
+						checkVanished(store.UID(num))
+					}
+				}
+				vanishedUIDs = append(vanishedUIDs, maps.Keys(more)...)
+			}
+		}
 
 		// Release the account lock.
 		runlock()
 		runlock = func() {} // Prevent defer from unlocking again.
 
+		// First report all vanished UIDs. ../rfc/7162:1714
+		if len(vanishedUIDs) > 0 {
+			// Mention all vanished UIDs in compact numset form.
+			// ../rfc/7162:1985
+			sort.Slice(vanishedUIDs, func(i, j int) bool {
+				return vanishedUIDs[i] < vanishedUIDs[j]
+			})
+			// No hard limit on response sizes, but clients are recommended to not send more
+			// than 8k. We send a more conservative max 4k.
+			for _, s := range compactUIDSet(vanishedUIDs).Strings(4*1024 - 32) {
+				c.bwritelinef("* VANISHED (EARLIER) %s", s)
+			}
+		}
+
 		for _, uid := range uids {
 			cmd.uid = uid
+			cmd.conn.log.Debug("processing uid", slog.Any("uid", uid))
 			cmd.process(atts)
+		}
+
+		var zeromc store.MailboxCounts
+		if cmd.deltaCounts != zeromc {
+			mb.Add(cmd.deltaCounts) // Unseen/Unread will be <= 0.
+			err := tx.Update(&mb)
+			xcheckf(err, "updating mailbox counts")
+			cmd.changes = append(cmd.changes, mb.ChangeCounts())
+			// No need to update account total message size.
 		}
 	})
 
@@ -113,6 +260,15 @@ func (c *conn) cmdxFetch(isUID bool, tag, cmdstr string, p *parser) {
 	}
 }
 
+func (cmd *fetchCmd) xmodseq() store.ModSeq {
+	if cmd.modseq == 0 {
+		var err error
+		cmd.modseq, err = cmd.conn.account.NextModSeq(cmd.tx)
+		cmd.xcheckf(err, "assigning next modseq")
+	}
+	return cmd.modseq
+}
+
 func (cmd *fetchCmd) xensureMessage() *store.Message {
 	if cmd.m != nil {
 		return cmd.m
@@ -120,6 +276,7 @@ func (cmd *fetchCmd) xensureMessage() *store.Message {
 
 	q := bstore.QueryTx[store.Message](cmd.tx)
 	q.FilterNonzero(store.Message{MailboxID: cmd.mailboxID, UID: cmd.uid})
+	q.FilterEqual("Expunged", false)
 	m, err := q.Get()
 	cmd.xcheckf(err, "get message for uid %d", cmd.uid)
 	cmd.m = &m
@@ -170,7 +327,7 @@ func (cmd *fetchCmd) process(atts []fetchAtt) {
 			cmd.expungeIssued = true
 			return
 		}
-		cmd.conn.log.Infox("processing fetch attribute", err, mlog.Field("uid", cmd.uid))
+		cmd.conn.log.Infox("processing fetch attribute", err, slog.Any("uid", cmd.uid))
 		xuserErrorf("processing fetch attribute: %v", err)
 	}()
 
@@ -178,6 +335,7 @@ func (cmd *fetchCmd) process(atts []fetchAtt) {
 
 	cmd.markSeen = false
 	cmd.needFlags = false
+	cmd.needModseq = false
 
 	for _, a := range atts {
 		data = append(data, cmd.xprocessAtt(a)...)
@@ -185,16 +343,41 @@ func (cmd *fetchCmd) process(atts []fetchAtt) {
 
 	if cmd.markSeen {
 		m := cmd.xensureMessage()
+		cmd.deltaCounts.Sub(m.MailboxCounts())
+		origFlags := m.Flags
 		m.Seen = true
+		cmd.deltaCounts.Add(m.MailboxCounts())
+		m.ModSeq = cmd.xmodseq()
 		err := cmd.tx.Update(m)
 		xcheckf(err, "marking message as seen")
+		// No need to update account total message size.
 
-		cmd.changes = append(cmd.changes, store.ChangeFlags{MailboxID: cmd.mailboxID, UID: cmd.uid, Mask: store.Flags{Seen: true}, Flags: m.Flags})
+		cmd.changes = append(cmd.changes, m.ChangeFlags(origFlags))
 	}
 
 	if cmd.needFlags {
 		m := cmd.xensureMessage()
-		data = append(data, bare("FLAGS"), flaglist(m.Flags))
+		data = append(data, bare("FLAGS"), flaglist(m.Flags, m.Keywords))
+	}
+
+	// The wording around when to include the MODSEQ attribute is hard to follow and is
+	// specified and refined in several places.
+	//
+	// An additional rule applies to "QRESYNC servers" (we'll assume it only applies
+	// when QRESYNC is enabled on a connection): setting the \Seen flag also triggers
+	// sending MODSEQ, and so does a UID FETCH command. ../rfc/7162:1421
+	//
+	// For example, ../rfc/7162:389 says the server must include modseq in "all
+	// subsequent untagged fetch responses", then lists cases, but leaves out FETCH/UID
+	// FETCH. That appears intentional, it is not a list of examples, it is the full
+	// list, and the "all subsequent untagged fetch responses" doesn't mean "all", just
+	// those covering the listed cases. That makes sense, because otherwise all the
+	// other mentioning of cases elsewhere in the RFC would be too superfluous.
+	//
+	// ../rfc/7162:877 ../rfc/7162:388 ../rfc/7162:909 ../rfc/7162:1426
+	if cmd.needModseq || cmd.hasChangedSince || cmd.conn.enabled[capQresync] && (cmd.isUID || cmd.markSeen) {
+		m := cmd.xensureMessage()
+		data = append(data, bare("MODSEQ"), listspace{bare(fmt.Sprintf("%d", m.ModSeq.Client()))})
 	}
 
 	// Write errors are turned into panics because we write through c.
@@ -223,7 +406,7 @@ func (cmd *fetchCmd) xprocessAtt(a fetchAtt) []token {
 
 	case "BODYSTRUCTURE":
 		_, part := cmd.xensureParsed()
-		bs := xbodystructure(part)
+		bs := xbodystructure(part, true)
 		return []token{bare("BODYSTRUCTURE"), bs}
 
 	case "BODY":
@@ -300,6 +483,9 @@ func (cmd *fetchCmd) xprocessAtt(a fetchAtt) []token {
 
 	case "FLAGS":
 		cmd.needFlags = true
+
+	case "MODSEQ":
+		cmd.needModseq = true
 
 	default:
 		xserverErrorf("field %q not yet implemented", a.field)
@@ -474,7 +660,7 @@ func (cmd *fetchCmd) xbody(a fetchAtt) (string, token) {
 
 	if a.section == nil {
 		// Non-extensible form of BODYSTRUCTURE.
-		return a.field, xbodystructure(part)
+		return a.field, xbodystructure(part, false)
 	}
 
 	cmd.peekOrSeen(a.peek)
@@ -679,20 +865,33 @@ func bodyFldEnc(s string) token {
 
 // xbodystructure returns a "body".
 // calls itself for multipart messages and message/{rfc822,global}.
-func xbodystructure(p *message.Part) token {
+func xbodystructure(p *message.Part, extensible bool) token {
 	if p.MediaType == "MULTIPART" {
 		// Multipart, ../rfc/9051:6355 ../rfc/9051:6411
 		var bodies concat
 		for i := range p.Parts {
-			bodies = append(bodies, xbodystructure(&p.Parts[i]))
+			bodies = append(bodies, xbodystructure(&p.Parts[i], extensible))
 		}
-		return listspace{bodies, string0(p.MediaSubType)}
+		r := listspace{bodies, string0(p.MediaSubType)}
+		if extensible {
+			if len(p.ContentTypeParams) == 0 {
+				r = append(r, nilt)
+			} else {
+				params := make(listspace, 0, 2*len(p.ContentTypeParams))
+				for k, v := range p.ContentTypeParams {
+					params = append(params, string0(k), string0(v))
+				}
+				r = append(r, params)
+			}
+		}
+		return r
 	}
 
 	// ../rfc/9051:6355
+	var r listspace
 	if p.MediaType == "TEXT" {
 		// ../rfc/9051:6404 ../rfc/9051:6418
-		return listspace{
+		r = listspace{
 			dquote("TEXT"), string0(p.MediaSubType), // ../rfc/9051:6739
 			// ../rfc/9051:6376
 			bodyFldParams(p.ContentTypeParams), // ../rfc/9051:6401
@@ -705,7 +904,7 @@ func xbodystructure(p *message.Part) token {
 	} else if p.MediaType == "MESSAGE" && (p.MediaSubType == "RFC822" || p.MediaSubType == "GLOBAL") {
 		// ../rfc/9051:6415
 		// note: we don't have to prepare p.Message for reading, because we aren't going to read from it.
-		return listspace{
+		r = listspace{
 			dquote("MESSAGE"), dquote(p.MediaSubType), // ../rfc/9051:6732
 			// ../rfc/9051:6376
 			bodyFldParams(p.ContentTypeParams), // ../rfc/9051:6401
@@ -714,25 +913,28 @@ func xbodystructure(p *message.Part) token {
 			bodyFldEnc(p.ContentTransferEncoding),
 			number(p.EndOffset - p.BodyOffset),
 			xenvelope(p.Message),
-			xbodystructure(p.Message),
+			xbodystructure(p.Message, extensible),
 			number(p.RawLineCount), // todo: or mp.RawLineCount?
 		}
+	} else {
+		var media token
+		switch p.MediaType {
+		case "APPLICATION", "AUDIO", "IMAGE", "FONT", "MESSAGE", "MODEL", "VIDEO":
+			media = dquote(p.MediaType)
+		default:
+			media = string0(p.MediaType)
+		}
+		// ../rfc/9051:6404 ../rfc/9051:6407
+		r = listspace{
+			media, string0(p.MediaSubType), // ../rfc/9051:6723
+			// ../rfc/9051:6376
+			bodyFldParams(p.ContentTypeParams), // ../rfc/9051:6401
+			nilOrString(p.ContentID),
+			nilOrString(p.ContentDescription),
+			bodyFldEnc(p.ContentTransferEncoding),
+			number(p.EndOffset - p.BodyOffset),
+		}
 	}
-	var media token
-	switch p.MediaType {
-	case "APPLICATION", "AUDIO", "IMAGE", "FONT", "MESSAGE", "MODEL", "VIDEO":
-		media = dquote(p.MediaType)
-	default:
-		media = string0(p.MediaType)
-	}
-	// ../rfc/9051:6404 ../rfc/9051:6407
-	return listspace{
-		media, string0(p.MediaSubType), // ../rfc/9051:6723
-		// ../rfc/9051:6376
-		bodyFldParams(p.ContentTypeParams), // ../rfc/9051:6401
-		nilOrString(p.ContentID),
-		nilOrString(p.ContentDescription),
-		bodyFldEnc(p.ContentTransferEncoding),
-		number(p.EndOffset - p.BodyOffset),
-	}
+	// todo: if "extensible", we could add the value of the "content-md5" header. we don't have it in our parsed data structure, so we don't add it. likely no one would use it, also not any of the other optional fields. ../rfc/9051:6366
+	return r
 }
