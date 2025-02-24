@@ -11,11 +11,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	golog "log"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -23,7 +25,10 @@ import (
 
 	"github.com/mjl-/sconf"
 
+	"github.com/mjl-/mox/admin"
 	"github.com/mjl-/mox/config"
+	"github.com/mjl-/mox/dkim"
+	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/junk"
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
@@ -47,8 +52,12 @@ automatically initialized with configuration files, an account with email
 address mox@localhost and password moxmoxmox, and a newly generated self-signed
 TLS certificate.
 
-All incoming email to any address is accepted (if checks pass), unless the
-recipient localpart ends with:
+Incoming messages are delivered as normal, falling back to accepting and
+delivering to the mox account for unknown addresses.
+Submitted messages are added to the queue, which delivers by ignoring the
+destination servers, always connecting to itself instead.
+
+Recipient addresses with the following localpart suffixes are handled specially:
 
 - "temperror": fail with a temporary error code
 - "permerror": fail with a permanent error code
@@ -64,33 +73,62 @@ during those commands instead of during "data".
 	if userConfDir == "" {
 		userConfDir = "."
 	}
+	// If we are being run to gather help output, show a placeholder directory
+	// instead of evaluating to the actual userconfigdir on the host os.
+	if c._gather {
+		userConfDir = "$userconfigdir"
+	}
 
-	var dir string
+	var dir, ip string
+	var initOnly bool
 	c.flag.StringVar(&dir, "dir", filepath.Join(userConfDir, "mox-localserve"), "configuration storage directory")
+	c.flag.StringVar(&ip, "ip", "", "serve on this ip instead of default 127.0.0.1 and ::1. only used when writing configuration, at first launch.")
+	c.flag.BoolVar(&initOnly, "initonly", false, "write configuration files and exit")
 	args := c.Parse()
 	if len(args) != 0 {
 		c.Usage()
 	}
 
-	log := mlog.New("localserve")
+	log := c.log
+	mox.FilesImmediate = true
 
-	// Load config, creating a new one if needed.
-	if _, err := os.Stat(dir); err != nil && os.IsNotExist(err) {
-		err := writeLocalConfig(log, dir)
-		if err != nil {
-			log.Fatalx("creating mox localserve config", err, mlog.Field("dir", dir))
+	if initOnly {
+		if _, err := os.Stat(dir); err == nil {
+			log.Print("warning: directory for configuration files already exists, continuing")
 		}
-	} else if err != nil {
-		log.Fatalx("stat config dir", err, mlog.Field("dir", dir))
-	} else if err := localLoadConfig(log, dir); err != nil {
-		log.Fatalx("loading mox localserve config (hint: when creating a new config with -dir, the directory must not yet exist)", err, mlog.Field("dir", dir))
+		log.Print("creating mox localserve config", slog.String("dir", dir))
+		err := writeLocalConfig(log, dir, ip)
+		if err != nil {
+			log.Fatalx("creating mox localserve config", err, slog.String("dir", dir))
+		}
+		return
 	}
 
-	if level, ok := mlog.Levels[loglevel]; loglevel != "" && ok {
-		mox.Conf.Log[""] = level
-		mlog.SetConfig(mox.Conf.Log)
-	} else if loglevel != "" && !ok {
-		log.Fatal("unknown loglevel", mlog.Field("loglevel", loglevel))
+	// Load config, creating a new one if needed.
+	var existingConfig bool
+	if _, err := os.Stat(dir); err != nil && os.IsNotExist(err) {
+		err := writeLocalConfig(log, dir, ip)
+		if err != nil {
+			log.Fatalx("creating mox localserve config", err, slog.String("dir", dir))
+		}
+	} else if err != nil {
+		log.Fatalx("stat config dir", err, slog.String("dir", dir))
+	} else if err := localLoadConfig(log, dir); err != nil {
+		log.Fatalx("loading mox localserve config (hint: when creating a new config with -dir, the directory must not yet exist)", err, slog.String("dir", dir))
+	} else if ip != "" {
+		log.Fatal("can only use -ip when writing a new config file")
+	} else {
+		existingConfig = true
+	}
+
+	// For new configs, we keep the "info" loglevel set by writeLocalConfig until after
+	// initializing database files, to prevent lots of schema upgrade logging.
+	fallbackLevel := mox.Conf.Static.LogLevel
+	if fallbackLevel == "" {
+		fallbackLevel = "debug"
+	}
+	if existingConfig {
+		loadLoglevel(log, fallbackLevel)
 	}
 
 	// Initialize receivedid.
@@ -114,14 +152,20 @@ during those commands instead of during "data".
 	smtpserver.Localserve = true
 	// Tell queue it shouldn't be queuing/delivering.
 	queue.Localserve = true
+	// Tell DKIM not to fail signatures for TLD localhost.
+	dkim.Localserve = true
 
-	mox.ListenImmediate = true
 	const mtastsdbRefresher = false
+	const sendDMARCReports = false
+	const sendTLSReports = false
 	const skipForkExec = true
-	if err := start(mtastsdbRefresher, skipForkExec); err != nil {
+	if err := start(mtastsdbRefresher, sendDMARCReports, sendTLSReports, skipForkExec); err != nil {
 		log.Fatalx("starting mox", err)
 	}
-	golog.Printf("mox, version %s", moxvar.Version)
+
+	loadLoglevel(log, fallbackLevel)
+
+	golog.Printf("mox, version %s %s/%s", moxvar.Version, runtime.GOOS, runtime.GOARCH)
 	golog.Print("")
 	golog.Printf("the default user is mox@localhost, with password moxmoxmox")
 	golog.Printf("the default admin password is moxadmin")
@@ -134,19 +178,30 @@ during those commands instead of during "data".
 	golog.Printf(`- [45][0-9][0-9]: fail with the specific error code.`)
 	golog.Printf(`- "timeout": no response (for an hour).`)
 	golog.Print("")
-	golog.Printf(`if the localpart begins with "mailfrom" or "rcptto", the error is returned during those commands instead of during "data"`)
+	golog.Print(`if the localpart begins with "mailfrom" or "rcptto", the error is returned`)
+	golog.Print(`during those commands instead of during "data".  if the localpart begins with`)
+	golog.Print(`"queue", the submission is accepted but delivery from the queue will fail.`)
 	golog.Print("")
-	golog.Print(" smtp://localhost:1025                                    - receive email")
-	golog.Print("smtps://mox%40localhost:moxmoxmox@localhost:1465          - send email")
-	golog.Print(" smtp://mox%40localhost:moxmoxmox@localhost:1587          - send email (without tls)")
-	golog.Print("imaps://mox%40localhost:moxmoxmox@localhost:1993          - read email")
-	golog.Print(" imap://mox%40localhost:moxmoxmox@localhost:1143          - read email (without tls)")
-	golog.Print("https://mox%40localhost:moxmoxmox@localhost:1443/account/ - account https")
-	golog.Print(" http://mox%40localhost:moxmoxmox@localhost:1080/account/ - account http (without tls)")
-	golog.Print("https://admin:moxadmin@localhost:1443/admin/              - admin https")
-	golog.Print(" http://admin:moxadmin@localhost:1080/admin/              - admin http (without tls)")
+	golog.Print(" smtp://localhost:1025                           - receive email")
+	golog.Print("smtps://mox%40localhost:moxmoxmox@localhost:1465 - send email")
+	golog.Print(" smtp://mox%40localhost:moxmoxmox@localhost:1587 - send email (without tls)")
+	golog.Print("imaps://mox%40localhost:moxmoxmox@localhost:1993 - read email")
+	golog.Print(" imap://mox%40localhost:moxmoxmox@localhost:1143 - read email (without tls)")
+	golog.Print("https://localhost:1443/account/                  - account https (email mox@localhost, password moxmoxmox)")
+	golog.Print(" http://localhost:1080/account/                  - account http (without tls)")
+	golog.Print("https://localhost:1443/webmail/                  - webmail https (email mox@localhost, password moxmoxmox)")
+	golog.Print(" http://localhost:1080/webmail/                  - webmail http (without tls)")
+	golog.Print("https://localhost:1443/webapi/                   - webmail https (email mox@localhost, password moxmoxmox)")
+	golog.Print(" http://localhost:1080/webapi/                   - webmail http (without tls)")
+	golog.Print("https://localhost:1443/admin/                    - admin https (password moxadmin)")
+	golog.Print(" http://localhost:1080/admin/                    - admin http (without tls)")
 	golog.Print("")
-	golog.Printf("serving from %s", dir)
+	if existingConfig {
+		golog.Printf("serving from existing config dir %s/", dir)
+		golog.Printf("if urls above don't work, consider resetting by removing config dir")
+	} else {
+		golog.Printf("serving from newly created config dir %s/", dir)
+	}
 
 	ctlpath := mox.DataDirPath("ctl")
 	_ = os.Remove(ctlpath)
@@ -163,7 +218,7 @@ during those commands instead of during "data".
 			}
 			cid := mox.Cid()
 			ctx := context.WithValue(mox.Context, mlog.CidKey, cid)
-			go servectl(ctx, log.WithCid(cid), conn, func() { shutdown(log) })
+			go servectl(ctx, cid, log.WithCid(cid), conn, func() { shutdown(log) })
 		}
 	}()
 
@@ -171,7 +226,7 @@ during those commands instead of during "data".
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 	sig := <-sigc
-	log.Print("shutting down, waiting max 3s for existing connections", mlog.Field("signal", sig))
+	log.Print("shutting down, waiting max 3s for existing connections", slog.Any("signal", sig))
 	shutdown(log)
 	if num, ok := sig.(syscall.Signal); ok {
 		os.Exit(int(num))
@@ -180,7 +235,7 @@ during those commands instead of during "data".
 	}
 }
 
-func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
+func writeLocalConfig(log mlog.Log, dir, ip string) (rerr error) {
 	defer func() {
 		x := recover()
 		if x != nil {
@@ -190,7 +245,7 @@ func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
 		}
 		if rerr != nil {
 			err := os.RemoveAll(dir)
-			log.Check(err, "removing config directory", mlog.Field("dir", dir))
+			log.Check(err, "removing config directory", slog.String("dir", dir))
 		}
 	}()
 
@@ -256,9 +311,13 @@ func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
 	xcheck(err, "writing adminpasswd file")
 
 	// Write mox.conf.
+	ips := []string{"127.0.0.1", "::1"}
+	if ip != "" {
+		ips = []string{ip}
+	}
 
 	local := config.Listener{
-		IPs: []string{"127.0.0.1", "::1"},
+		IPs: ips,
 		TLS: &config.TLS{
 			KeyCerts: []config.KeyCert{
 				{
@@ -286,6 +345,18 @@ func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
 	local.AccountHTTPS.Enabled = true
 	local.AccountHTTPS.Port = 1443
 	local.AccountHTTPS.Path = "/account/"
+	local.WebmailHTTP.Enabled = true
+	local.WebmailHTTP.Port = 1080
+	local.WebmailHTTP.Path = "/webmail/"
+	local.WebmailHTTPS.Enabled = true
+	local.WebmailHTTPS.Port = 1443
+	local.WebmailHTTPS.Path = "/webmail/"
+	local.WebAPIHTTP.Enabled = true
+	local.WebAPIHTTP.Port = 1080
+	local.WebAPIHTTP.Path = "/webapi/"
+	local.WebAPIHTTPS.Enabled = true
+	local.WebAPIHTTPS.Port = 1443
+	local.WebAPIHTTPS.Path = "/webapi/"
 	local.AdminHTTP.Enabled = true
 	local.AdminHTTP.Port = 1080
 	local.AdminHTTPS.Enabled = true
@@ -297,11 +368,15 @@ func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
 	local.WebserverHTTPS.Enabled = true
 	local.WebserverHTTPS.Port = 1443
 
+	uid := os.Getuid()
+	if uid < 0 {
+		uid = 1 // For windows.
+	}
 	static := config.Static{
 		DataDir:           ".",
 		LogLevel:          "traceauth",
 		Hostname:          "localhost",
-		User:              fmt.Sprintf("%d", os.Getuid()),
+		User:              fmt.Sprintf("%d", uid),
 		AdminPasswordFile: "adminpasswd",
 		Pedantic:          true,
 		Listeners: map[string]config.Listener{
@@ -325,10 +400,13 @@ func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
 
 	// Write domains.conf.
 	acc := config.Account{
-		RejectsMailbox: "Rejects",
+		KeepRetiredMessagePeriod: 72 * time.Hour,
+		KeepRetiredWebhookPeriod: 72 * time.Hour,
+		RejectsMailbox:           "Rejects",
 		Destinations: map[string]config.Destination{
 			"mox@localhost": {},
 		},
+		NoFirstTimeSenderDelay: true,
 	}
 	acc.AutomaticJunkFlags.Enabled = true
 	acc.AutomaticJunkFlags.JunkMailboxRegexp = "^(junk|spam)"
@@ -344,10 +422,25 @@ func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
 		},
 	}
 
+	dkimKeyBuf, err := admin.MakeDKIMEd25519Key(dns.Domain{ASCII: "localserve"}, dns.Domain{ASCII: "localhost"})
+	xcheck(err, "making dkim key")
+	dkimKeyPath := "dkim.localserve.privatekey.pkcs8.pem"
+	err = os.WriteFile(filepath.Join(dir, dkimKeyPath), dkimKeyBuf, 0660)
+	xcheck(err, "writing dkim key file")
+
 	dynamic := config.Dynamic{
 		Domains: map[string]config.Domain{
 			"localhost": {
 				LocalpartCatchallSeparator: "+",
+				DKIM: config.DKIM{
+					Sign: []string{"localserve"},
+					Selectors: map[string]config.Selector{
+						"localserve": {
+							Expiration:     "72h",
+							PrivateKeyFile: dkimKeyPath,
+						},
+					},
+				},
 			},
 		},
 		Accounts: map[string]config.Account{
@@ -385,11 +478,14 @@ func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
 	err = localLoadConfig(log, dir)
 	xcheck(err, "loading config")
 
+	// Info so we don't log lots about initializing database.
+	loadLoglevel(log, "info")
+
 	// Set password on account.
-	a, _, err := store.OpenEmail("mox@localhost")
+	a, _, _, err := store.OpenEmail(log, "mox@localhost", false)
 	xcheck(err, "opening account to set password")
 	password := "moxmoxmox"
-	err = a.SetPassword(password)
+	err = a.SetPassword(log, password)
 	xcheck(err, "setting password")
 	err = a.Close()
 	xcheck(err, "closing account")
@@ -398,10 +494,23 @@ func writeLocalConfig(log *mlog.Log, dir string) (rerr error) {
 	return nil
 }
 
-func localLoadConfig(log *mlog.Log, dir string) error {
+func loadLoglevel(log mlog.Log, fallback string) {
+	ll := loglevel
+	if ll == "" {
+		ll = fallback
+	}
+	if level, ok := mlog.Levels[ll]; ok {
+		mox.Conf.Log[""] = level
+		mlog.SetConfig(mox.Conf.Log)
+	} else {
+		log.Fatal("unknown loglevel", slog.String("loglevel", loglevel))
+	}
+}
+
+func localLoadConfig(log mlog.Log, dir string) error {
 	mox.ConfigStaticPath = filepath.Join(dir, "mox.conf")
 	mox.ConfigDynamicPath = filepath.Join(dir, "domains.conf")
-	errs := mox.LoadConfig(context.Background(), false)
+	errs := mox.LoadConfig(context.Background(), log, true, false)
 	if len(errs) > 1 {
 		log.Error("loading config generated config file: multiple errors")
 		for _, err := range errs {

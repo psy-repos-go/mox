@@ -6,10 +6,14 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/mjl-/mox/dns"
-	"github.com/mjl-/mox/moxvar"
 	"github.com/mjl-/mox/smtp"
 )
+
+// Pedantic enables stricter parsing.
+var Pedantic bool
 
 type parseErr string
 
@@ -200,18 +204,18 @@ func (p *parser) xdomainselector(isselector bool) dns.Domain {
 		// domain names must always be a-labels, ../rfc/6376:1115 ../rfc/6376:1187 ../rfc/6376:1303
 		// dkim selectors with underscores happen in the wild, accept them when not in
 		// pedantic mode. ../rfc/6376:581 ../rfc/5321:2303
-		return isalphadigit(c) || (i > 0 && (c == '-' || isselector && !moxvar.Pedantic && c == '_') && p.o+1 < len(p.s))
+		return isalphadigit(c) || (i > 0 && (c == '-' || isselector && !Pedantic && c == '_') && p.o+1 < len(p.s))
 	}
 	s := p.xtakefn1(false, subdomain)
 	for p.hasPrefix(".") {
 		s += p.xtake(".") + p.xtakefn1(false, subdomain)
 	}
+	if isselector {
+		// Not to be interpreted as IDNA.
+		return dns.Domain{ASCII: strings.ToLower(s)}
+	}
 	d, err := dns.ParseDomain(s)
 	if err != nil {
-		// ParseDomain does not allow underscore, work around it.
-		if strings.Contains(s, "_") && isselector && !moxvar.Pedantic {
-			return dns.Domain{ASCII: strings.ToLower(s)}
-		}
 		p.xerrorf("parsing domain %q: %s", s, err)
 	}
 	return d
@@ -273,11 +277,11 @@ func (p *parser) xlocalpart() smtp.Localpart {
 		}
 	}
 	// In the wild, some services use large localparts for generated (bounce) addresses.
-	if moxvar.Pedantic && len(s) > 64 || len(s) > 128 {
+	if Pedantic && len(s) > 64 || len(s) > 128 {
 		// ../rfc/5321:3486
 		p.xerrorf("localpart longer than 64 octets")
 	}
-	return smtp.Localpart(s)
+	return smtp.Localpart(norm.NFC.String(s))
 }
 
 func (p *parser) xquotedString() string {

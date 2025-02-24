@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func (c *Conn) recorded() string {
@@ -22,7 +23,7 @@ func (c *Conn) recordAdd(buf []byte) {
 
 func (c *Conn) xtake(s string) {
 	buf := make([]byte, len(s))
-	_, err := io.ReadFull(c.r, buf)
+	_, err := io.ReadFull(c.br, buf)
 	c.xcheckf(err, "taking %q", s)
 	if !strings.EqualFold(string(buf), s) {
 		c.xerrorf("got %q, expected %q", buf, s)
@@ -31,7 +32,7 @@ func (c *Conn) xtake(s string) {
 }
 
 func (c *Conn) readbyte() (byte, error) {
-	b, err := c.r.ReadByte()
+	b, err := c.br.ReadByte()
 	if err == nil {
 		c.recordAdd([]byte{b})
 	}
@@ -42,16 +43,20 @@ func (c *Conn) unreadbyte() {
 	if c.record {
 		c.recordBuf = c.recordBuf[:len(c.recordBuf)-1]
 	}
-	err := c.r.UnreadByte()
+	err := c.br.UnreadByte()
 	c.xcheckf(err, "unread byte")
 }
 
 func (c *Conn) readrune() (rune, error) {
-	x, _, err := c.r.ReadRune()
+	x, _, err := c.br.ReadRune()
 	if err == nil {
 		c.recordAdd([]byte(string(x)))
 	}
 	return x, err
+}
+
+func (c *Conn) space() bool {
+	return c.take(' ')
 }
 
 func (c *Conn) xspace() {
@@ -68,6 +73,10 @@ func (c *Conn) peek(exp byte) bool {
 		c.unreadbyte()
 	}
 	return err == nil && strings.EqualFold(string(rune(b)), string(rune(exp)))
+}
+
+func (c *Conn) peekstring() bool {
+	return c.peek('"') || c.peek('{')
 }
 
 func (c *Conn) take(exp byte) bool {
@@ -117,8 +126,11 @@ func (c *Conn) xrespText() RespText {
 var knownCodes = stringMap(
 	// Without parameters.
 	"ALERT", "PARSE", "READ-ONLY", "READ-WRITE", "TRYCREATE", "UIDNOTSTICKY", "UNAVAILABLE", "AUTHENTICATIONFAILED", "AUTHORIZATIONFAILED", "EXPIRED", "PRIVACYREQUIRED", "CONTACTADMIN", "NOPERM", "INUSE", "EXPUNGEISSUED", "CORRUPTION", "SERVERBUG", "CLIENTBUG", "CANNOT", "LIMIT", "OVERQUOTA", "ALREADYEXISTS", "NONEXISTENT", "NOTSAVED", "HASCHILDREN", "CLOSED", "UNKNOWN-CTE",
+	"OVERQUOTA",         // ../rfc/9208:472
+	"COMPRESSIONACTIVE", // ../rfc/4978:143
 	// With parameters.
 	"BADCHARSET", "CAPABILITY", "PERMANENTFLAGS", "UIDNEXT", "UIDVALIDITY", "UNSEEN", "APPENDUID", "COPYUID",
+	"HIGHESTMODSEQ", "MODIFIED",
 )
 
 func stringMap(l ...string) map[string]struct{} {
@@ -139,7 +151,7 @@ func (c *Conn) xrespCode() (string, CodeArg) {
 
 	if _, ok := knownCodes[W]; !ok {
 		var args []string
-		for c.take(' ') {
+		for c.space() {
 			arg := ""
 			for !c.peek(' ') && !c.peek(']') {
 				arg += string(rune(c.xbyte()))
@@ -153,10 +165,10 @@ func (c *Conn) xrespCode() (string, CodeArg) {
 	switch W {
 	case "BADCHARSET":
 		var l []string // Must be nil initially.
-		if c.take(' ') {
+		if c.space() {
 			c.xtake("(")
 			l = []string{c.xcharset()}
-			for c.take(' ') {
+			for c.space() {
 				l = append(l, c.xcharset())
 			}
 			c.xtake(")")
@@ -165,22 +177,23 @@ func (c *Conn) xrespCode() (string, CodeArg) {
 	case "CAPABILITY":
 		c.xtake(" ")
 		caps := []string{c.xatom()}
-		for c.take(' ') {
+		for c.space() {
 			caps = append(caps, c.xatom())
 		}
 		c.CapAvailable = map[Capability]struct{}{}
 		for _, cap := range caps {
+			cap = strings.ToUpper(cap)
 			c.CapAvailable[Capability(cap)] = struct{}{}
 		}
 		codeArg = CodeWords{W, caps}
 
 	case "PERMANENTFLAGS":
 		l := []string{} // Must be non-nil.
-		if c.take(' ') {
+		if c.space() {
 			c.xtake("(")
-			l = []string{c.xflag()}
-			for c.take(' ') {
-				l = append(l, c.xflag())
+			l = []string{c.xflagPerm()}
+			for c.space() {
+				l = append(l, c.xflagPerm())
 			}
 			c.xtake(")")
 		}
@@ -192,8 +205,8 @@ func (c *Conn) xrespCode() (string, CodeArg) {
 		c.xspace()
 		destUIDValidity := c.xnzuint32()
 		c.xspace()
-		uid := c.xnzuint32()
-		codeArg = CodeAppendUID{destUIDValidity, uid}
+		uids := c.xuidrange()
+		codeArg = CodeAppendUID{destUIDValidity, uids}
 	case "COPYUID":
 		c.xspace()
 		destUIDValidity := c.xnzuint32()
@@ -202,6 +215,13 @@ func (c *Conn) xrespCode() (string, CodeArg) {
 		c.xspace()
 		to := c.xuidset()
 		codeArg = CodeCopyUID{destUIDValidity, from, to}
+	case "HIGHESTMODSEQ":
+		c.xspace()
+		codeArg = CodeHighestModSeq(c.xint64())
+	case "MODIFIED":
+		c.xspace()
+		modified := c.xuidset()
+		codeArg = CodeModified(NumSet{Ranges: modified})
 	}
 	return W, codeArg
 }
@@ -239,6 +259,14 @@ func (c *Conn) xdigits() string {
 	}
 }
 
+func (c *Conn) peekdigit() bool {
+	if b, err := c.readbyte(); err == nil {
+		c.unreadbyte()
+		return b >= '0' && b <= '9'
+	}
+	return false
+}
+
 func (c *Conn) xint32() int32 {
 	s := c.xdigits()
 	num, err := strconv.ParseInt(s, 10, 32)
@@ -248,7 +276,7 @@ func (c *Conn) xint32() int32 {
 
 func (c *Conn) xint64() int64 {
 	s := c.xdigits()
-	num, err := strconv.ParseInt(s, 10, 64)
+	num, err := strconv.ParseInt(s, 10, 63)
 	c.xcheckf(err, "parsing int64")
 	return num
 }
@@ -312,11 +340,12 @@ func (c *Conn) xuntagged() Untagged {
 	case "CAPABILITY":
 		// ../rfc/9051:6427
 		var caps []string
-		for c.take(' ') {
+		for c.space() {
 			caps = append(caps, c.xnonspace())
 		}
 		c.CapAvailable = map[Capability]struct{}{}
 		for _, cap := range caps {
+			cap = strings.ToUpper(cap)
 			c.CapAvailable[Capability(cap)] = struct{}{}
 		}
 		r := UntaggedCapability(caps)
@@ -326,10 +355,11 @@ func (c *Conn) xuntagged() Untagged {
 	case "ENABLED":
 		// ../rfc/9051:6520
 		var caps []string
-		for c.take(' ') {
+		for c.space() {
 			caps = append(caps, c.xnonspace())
 		}
 		for _, cap := range caps {
+			cap = strings.ToUpper(cap)
 			c.CapEnabled[Capability(cap)] = struct{}{}
 		}
 		r := UntaggedEnabled(caps)
@@ -354,14 +384,14 @@ func (c *Conn) xuntagged() Untagged {
 		mailbox := c.xastring()
 		c.xspace()
 		c.xtake("(")
-		attrs := map[string]int64{}
+		attrs := map[StatusAttr]int64{}
 		for !c.take(')') {
 			if len(attrs) > 0 {
 				c.xspace()
 			}
-			s := c.xword()
+			s := c.xatom()
 			c.xspace()
-			S := strings.ToUpper(s)
+			S := StatusAttr(strings.ToUpper(s))
 			var num int64
 			// ../rfc/9051:7059
 			switch S {
@@ -386,6 +416,10 @@ func (c *Conn) xuntagged() Untagged {
 				} else {
 					num = c.xint64()
 				}
+			case "HIGHESTMODSEQ":
+				num = c.xint64()
+			case "DELETED-STORAGE":
+				num = c.xint64()
 			default:
 				c.xerrorf("status: unknown attribute %q", s)
 			}
@@ -395,6 +429,53 @@ func (c *Conn) xuntagged() Untagged {
 			attrs[S] = num
 		}
 		r := UntaggedStatus{mailbox, attrs}
+		c.xcrlf()
+		return r
+
+	case "METADATA":
+		// ../rfc/5464:807
+		c.xspace()
+		mailbox := c.xastring()
+		c.xspace()
+		if !c.take('(') {
+			// Unsolicited form, with only annotation keys, not values.
+			var keys []string
+			for {
+				key := c.xastring()
+				keys = append(keys, key)
+				if !c.space() {
+					break
+				}
+			}
+			c.xcrlf()
+			return UntaggedMetadataKeys{mailbox, keys}
+		}
+
+		// Form with values, in response to GETMETADATA command.
+		r := UntaggedMetadataAnnotations{Mailbox: mailbox}
+		for {
+			key := c.xastring()
+			c.xspace()
+			var value []byte
+			var isString bool
+			if c.take('~') {
+				value = c.xliteral()
+			} else if c.peek('"') {
+				value = []byte(c.xstring())
+				isString = true
+				// note: the abnf also allows nstring, but that only makes sense when the
+				// production rule is used in the setmetadata command. ../rfc/5464:831
+			} else {
+				// For response to extended list.
+				c.xtake("nil")
+			}
+			r.Annotations = append(r.Annotations, Annotation{key, isString, value})
+
+			if c.take(')') {
+				break
+			}
+			c.xspace()
+		}
 		c.xcrlf()
 		return r
 
@@ -414,7 +495,16 @@ func (c *Conn) xuntagged() Untagged {
 		// ../rfc/9051:6809
 		c.xneedDisabled("untagged SEARCH response", CapIMAP4rev2)
 		var nums []uint32
-		for c.take(' ') {
+		for c.space() {
+			// ../rfc/7162:2557
+			if c.take('(') {
+				c.xtake("MODSEQ")
+				c.xspace()
+				modseq := c.xint64()
+				c.xtake(")")
+				c.xcrlf()
+				return UntaggedSearchModSeq{nums, modseq}
+			}
 			nums = append(nums, c.xnzuint32())
 		}
 		r := UntaggedSearch(nums)
@@ -451,10 +541,67 @@ func (c *Conn) xuntagged() Untagged {
 				params[k] = v
 			}
 		} else {
-			c.xtake("NIL")
+			c.xtake("nil")
 		}
 		c.xcrlf()
 		return UntaggedID(params)
+
+	// ../rfc/7162:2623
+	case "VANISHED":
+		c.xspace()
+		var earlier bool
+		if c.take('(') {
+			c.xtake("EARLIER")
+			c.xtake(")")
+			c.xspace()
+			earlier = true
+		}
+		uids := c.xuidset()
+		c.xcrlf()
+		return UntaggedVanished{earlier, NumSet{Ranges: uids}}
+
+	// ../rfc/9208:668 ../2087:242
+	case "QUOTAROOT":
+		c.xspace()
+		c.xastring()
+		var roots []string
+		for c.space() {
+			root := c.xastring()
+			roots = append(roots, root)
+		}
+		c.xcrlf()
+		return UntaggedQuotaroot(roots)
+
+	// ../rfc/9208:666 ../rfc/2087:239
+	case "QUOTA":
+		c.xspace()
+		root := c.xastring()
+		c.xspace()
+		c.xtake("(")
+
+		xresource := func() QuotaResource {
+			name := c.xatom()
+			c.xspace()
+			usage := c.xint64()
+			c.xspace()
+			limit := c.xint64()
+			return QuotaResource{QuotaResourceName(strings.ToUpper(name)), usage, limit}
+		}
+
+		seen := map[QuotaResourceName]bool{}
+		l := []QuotaResource{xresource()}
+		seen[l[0].Name] = true
+		for c.space() {
+			res := xresource()
+			if seen[res.Name] {
+				c.xerrorf("duplicate resource name %q", res.Name)
+			}
+			seen[res.Name] = true
+			l = append(l, res)
+		}
+		c.xtake(")")
+		c.xcrlf()
+		return UntaggedQuota{root, l}
 
 	default:
 		v, err := strconv.ParseUint(w, 10, 32)
@@ -504,7 +651,7 @@ func (c *Conn) xuntagged() Untagged {
 func (c *Conn) xfetch(num uint32) UntaggedFetch {
 	c.xtake("(")
 	attrs := []FetchAttr{c.xmsgatt1()}
-	for c.take(' ') {
+	for c.space() {
 		attrs = append(attrs, c.xmsgatt1())
 	}
 	c.xtake(")")
@@ -532,7 +679,7 @@ func (c *Conn) xmsgatt1() FetchAttr {
 		var flags []string
 		if !c.take(')') {
 			flags = []string{c.xflag()}
-			for c.take(' ') {
+			for c.space() {
 				flags = append(flags, c.xflag())
 			}
 			c.xtake(")")
@@ -545,7 +692,23 @@ func (c *Conn) xmsgatt1() FetchAttr {
 
 	case "INTERNALDATE":
 		c.xspace()
-		return FetchInternalDate(c.xquoted()) // todo: parsed time
+		s := c.xquoted()
+		v, err := time.Parse("_2-Jan-2006 15:04:05 -0700", s)
+		c.xcheckf(err, "parsing internaldate")
+		return FetchInternalDate{v}
+
+	case "SAVEDATE":
+		c.xspace()
+		var t *time.Time
+		if c.peek('"') {
+			s := c.xquoted()
+			v, err := time.Parse("_2-Jan-2006 15:04:05 -0700", s)
+			c.xcheckf(err, "parsing savedate")
+			t = &v
+		} else {
+			c.xtake("nil")
+		}
+		return FetchSaveDate{t}
 
 	case "RFC822.SIZE":
 		c.xspace()
@@ -567,8 +730,8 @@ func (c *Conn) xmsgatt1() FetchAttr {
 		return FetchRFC822Text(s)
 
 	case "BODY":
-		if c.take(' ') {
-			return FetchBodystructure{F, c.xbodystructure()}
+		if c.space() {
+			return FetchBodystructure{F, c.xbodystructure(false)}
 		}
 		c.record = true
 		section := c.xsection()
@@ -584,7 +747,7 @@ func (c *Conn) xmsgatt1() FetchAttr {
 
 	case "BODYSTRUCTURE":
 		c.xspace()
-		return FetchBodystructure{F, c.xbodystructure()}
+		return FetchBodystructure{F, c.xbodystructure(true)}
 
 	case "BINARY":
 		c.record = true
@@ -605,6 +768,14 @@ func (c *Conn) xmsgatt1() FetchAttr {
 	case "UID":
 		c.xspace()
 		return FetchUID(c.xuint32())
+
+	case "MODSEQ":
+		// ../rfc/7162:2488
+		c.xspace()
+		c.xtake("(")
+		modseq := c.xint64()
+		c.xtake(")")
+		return FetchModSeq(modseq)
 	}
 	c.xerrorf("unknown fetch attribute %q", f)
 	panic("not reached")
@@ -616,7 +787,7 @@ func (c *Conn) xnilString() string {
 	} else if c.peek('{') {
 		return string(c.xliteral())
 	} else {
-		c.xtake("NIL")
+		c.xtake("nil")
 		return ""
 	}
 }
@@ -641,9 +812,9 @@ func (c *Conn) xatom() string {
 	var s string
 	for {
 		b, err := c.readbyte()
-		c.xcheckf(err, "read byte for flag")
+		c.xcheckf(err, "read byte for atom")
 		if b <= ' ' || strings.IndexByte("(){%*\"\\]", b) >= 0 {
-			c.r.UnreadByte()
+			c.br.UnreadByte()
 			if s == "" {
 				c.xerrorf("expected atom")
 			}
@@ -683,26 +854,38 @@ func (c *Conn) xliteral() []byte {
 		c.xerrorf("refusing to read more than 1MB: %d", size)
 	}
 	if sync {
-		_, err := fmt.Fprintf(c.conn, "+ ok\r\n")
+		_, err := fmt.Fprintf(c.bw, "+ ok\r\n")
 		c.xcheckf(err, "write continuation")
+		c.xflush()
 	}
 	buf := make([]byte, int(size))
-	_, err := io.ReadFull(c.r, buf)
+	_, err := io.ReadFull(c.br, buf)
 	c.xcheckf(err, "reading data for literal")
 	return buf
 }
 
 // ../rfc/9051:6565
 // todo: stricter
-func (c *Conn) xflag() string {
+func (c *Conn) xflag0(allowPerm bool) string {
 	s := ""
 	if c.take('\\') {
-		s = "\\"
+		s = `\`
+		if allowPerm && c.take('*') {
+			return `\*`
+		}
 	} else if c.take('$') {
 		s = "$"
 	}
 	s += c.xatom()
 	return s
+}
+
+func (c *Conn) xflag() string {
+	return c.xflag0(false)
+}
+
+func (c *Conn) xflagPerm() string {
+	return c.xflag0(true)
 }
 
 func (c *Conn) xsection() string {
@@ -733,50 +916,69 @@ func (c *Conn) xnilStringLiteral8() []byte {
 }
 
 // ../rfc/9051:6355
-func (c *Conn) xbodystructure() any {
+func (c *Conn) xbodystructure(extensibleForm bool) any {
 	c.xtake("(")
 	if c.peek('(') {
 		// ../rfc/9051:6411
-		parts := []any{c.xbodystructure()}
+		parts := []any{c.xbodystructure(extensibleForm)}
 		for c.peek('(') {
-			parts = append(parts, c.xbodystructure())
+			parts = append(parts, c.xbodystructure(extensibleForm))
 		}
 		c.xspace()
 		mediaSubtype := c.xstring()
-		// todo: parse optional body-ext-mpart
+		var ext *BodyExtensionMpart
+		if extensibleForm && c.space() {
+			ext = c.xbodyExtMpart()
+		}
 		c.xtake(")")
-		return BodyTypeMpart{parts, mediaSubtype}
+		return BodyTypeMpart{parts, mediaSubtype, ext}
 	}
 
+	// todo: verify the media(sub)type is valid for returned data.
+
+	var ext *BodyExtension1Part
 	mediaType := c.xstring()
 	c.xspace()
 	mediaSubtype := c.xstring()
 	c.xspace()
 	bodyFields := c.xbodyFields()
-	if c.take(' ') {
-		if c.peek('(') {
-			// ../rfc/9051:6415
-			envelope := c.xenvelope()
-			c.xspace()
-			bodyStructure := c.xbodystructure()
-			c.xspace()
-			lines := c.xint64()
-			c.xtake(")")
-			return BodyTypeMsg{mediaType, mediaSubtype, bodyFields, envelope, bodyStructure, lines}
-		}
-		// ../rfc/9051:6418
-		lines := c.xint64()
+	if !c.space() {
+		// Basic type without extension.
 		c.xtake(")")
-		return BodyTypeText{mediaType, mediaSubtype, bodyFields, lines}
+		return BodyTypeBasic{mediaType, mediaSubtype, bodyFields, nil}
 	}
-	// ../rfc/9051:6407
+	if c.peek('(') {
+		// ../rfc/9051:6415
+		envelope := c.xenvelope()
+		c.xspace()
+		bodyStructure := c.xbodystructure(extensibleForm)
+		c.xspace()
+		lines := c.xint64()
+		if extensibleForm && c.space() {
+			ext = c.xbodyExt1Part()
+		}
+		c.xtake(")")
+		return BodyTypeMsg{mediaType, mediaSubtype, bodyFields, envelope, bodyStructure, lines, ext}
+	}
+	if !strings.EqualFold(mediaType, "text") {
+		if !extensibleForm {
+			c.xerrorf("body result, basic type, with disallowed extensible form")
+		}
+		ext = c.xbodyExt1Part()
+		// ../rfc/9051:6407
+		c.xtake(")")
+		return BodyTypeBasic{mediaType, mediaSubtype, bodyFields, ext}
+	}
+	// ../rfc/9051:6418
+	lines := c.xint64()
+	if extensibleForm && c.space() {
+		ext = c.xbodyExt1Part()
+	}
 	c.xtake(")")
-	return BodyTypeBasic{mediaType, mediaSubtype, bodyFields}
-
-	// todo: verify the media(sub)type is valid for returned data.
+	return BodyTypeText{mediaType, mediaSubtype, bodyFields, lines, ext}
 }
 
-// ../rfc/9051:6376
+// ../rfc/9051:6376 ../rfc/3501:4604
 func (c *Conn) xbodyFields() BodyFields {
 	params := c.xbodyFldParam()
 	c.xspace()
@@ -790,14 +992,58 @@ func (c *Conn) xbodyFields() BodyFields {
 	return BodyFields{params, contentID, contentDescr, cte, octets}
 }
 
-// ../rfc/9051:6401
+// ../rfc/9051:6371 ../rfc/3501:4599
+func (c *Conn) xbodyExtMpart() (ext *BodyExtensionMpart) {
+	ext = &BodyExtensionMpart{}
+	ext.Params = c.xbodyFldParam()
+	if !c.space() {
+		return
+	}
+	ext.Disposition, ext.DispositionParams = c.xbodyFldDsp()
+	if !c.space() {
+		return
+	}
+	ext.Language = c.xbodyFldLang()
+	if !c.space() {
+		return
+	}
+	ext.Location = c.xbodyFldLoc()
+	for c.space() {
+		ext.More = append(ext.More, c.xbodyExtension())
+	}
+	return
+}
+
+// ../rfc/9051:6366 ../rfc/3501:4584
+func (c *Conn) xbodyExt1Part() (ext *BodyExtension1Part) {
+	ext = &BodyExtension1Part{}
+	ext.MD5 = c.xnilString()
+	if !c.space() {
+		return
+	}
+	ext.Disposition, ext.DispositionParams = c.xbodyFldDsp()
+	if !c.space() {
+		return
+	}
+	ext.Language = c.xbodyFldLang()
+	if !c.space() {
+		return
+	}
+	ext.Location = c.xbodyFldLoc()
+	for c.space() {
+		ext.More = append(ext.More, c.xbodyExtension())
+	}
+	return
+}
+
+// ../rfc/9051:6401 ../rfc/3501:4626
 func (c *Conn) xbodyFldParam() [][2]string {
 	if c.take('(') {
 		k := c.xstring()
 		c.xspace()
 		v := c.xstring()
 		l := [][2]string{{k, v}}
-		for c.take(' ') {
+		for c.space() {
 			k = c.xstring()
 			c.xspace()
 			v = c.xstring()
@@ -806,8 +1052,65 @@ func (c *Conn) xbodyFldParam() [][2]string {
 		c.xtake(")")
 		return l
 	}
-	c.xtake("NIL")
+	c.xtake("nil")
 	return nil
+}
+
+// ../rfc/9051:6381 ../rfc/3501:4609
+func (c *Conn) xbodyFldDsp() (string, [][2]string) {
+	if !c.take('(') {
+		c.xtake("nil")
+		return "", nil
+	}
+	disposition := c.xstring()
+	c.xspace()
+	param := c.xbodyFldParam()
+	c.xtake(")")
+	return disposition, param
+}
+
+// ../rfc/9051:6391 ../rfc/3501:4616
+func (c *Conn) xbodyFldLang() (lang []string) {
+	if c.take('(') {
+		lang = []string{c.xstring()}
+		for c.space() {
+			lang = append(lang, c.xstring())
+		}
+		c.xtake(")")
+		return lang
+	}
+	if c.peekstring() {
+		return []string{c.xstring()}
+	}
+	c.xtake("nil")
+	return nil
+}
+
+// ../rfc/9051:6393 ../rfc/3501:4618
+func (c *Conn) xbodyFldLoc() string {
+	return c.xnilString()
+}
+
+// ../rfc/9051:6357 ../rfc/3501:4575
+func (c *Conn) xbodyExtension() (ext BodyExtension) {
+	if c.take('(') {
+		for {
+			ext.More = append(ext.More, c.xbodyExtension())
+			if !c.space() {
+				break
+			}
+		}
+		c.xtake(")")
+	} else if c.peekdigit() {
+		num := c.xint64()
+		ext.Number = &num
+	} else if c.peekstring() {
+		str := c.xstring()
+		ext.String = &str
+	} else {
+		c.xtake("nil")
+	}
+	return ext
 }
 
 // ../rfc/9051:6522
@@ -839,7 +1142,7 @@ func (c *Conn) xenvelope() Envelope {
 // ../rfc/9051:6526
 func (c *Conn) xaddresses() []Address {
 	if !c.take('(') {
-		c.xtake("NIL")
+		c.xtake("nil")
 		return nil
 	}
 	l := []Address{c.xaddress()}
@@ -869,7 +1172,7 @@ func (c *Conn) xflagList() []string {
 	var l []string
 	if !c.take(')') {
 		l = []string{c.xflag()}
-		for c.take(' ') {
+		for c.space() {
 			l = append(l, c.xflag())
 		}
 		c.xtake(")")
@@ -883,7 +1186,7 @@ func (c *Conn) xmailboxList() UntaggedList {
 	var flags []string
 	if !c.peek(')') {
 		flags = append(flags, c.xflag())
-		for c.take(' ') {
+		for c.space() {
 			flags = append(flags, c.xflag())
 		}
 	}
@@ -898,16 +1201,16 @@ func (c *Conn) xmailboxList() UntaggedList {
 		}
 		b = byte(quoted[0])
 	} else if !c.peek(' ') {
-		c.xtake("NIL")
+		c.xtake("nil")
 	}
 	c.xspace()
 	mailbox := c.xastring()
 	ul := UntaggedList{flags, b, mailbox, nil, ""}
-	if c.take(' ') {
+	if c.space() {
 		c.xtake("(")
 		if !c.peek(')') {
 			c.xmboxListExtendedItem(&ul)
-			for c.take(' ') {
+			for c.space() {
 				c.xmboxListExtendedItem(&ul)
 			}
 		}
@@ -952,7 +1255,7 @@ func (c *Conn) xtaggedExtVal() TaggedExtVal {
 		return TaggedExtVal{SeqSet: &ss}
 	}
 	s := c.xdigits()
-	num, err := strconv.ParseInt(s, 10, 64)
+	num, err := strconv.ParseInt(s, 10, 63)
 	c.xcheckf(err, "parsing int")
 	if !c.peek(':') && !c.peek(',') {
 		// not a larger sequence-set
@@ -1010,7 +1313,7 @@ func (c *Conn) xtaggedExtComp() TaggedExtComp {
 		return TaggedExtComp{String: s}
 	}
 	l := []TaggedExtComp{{String: s}}
-	for c.take(' ') {
+	for c.space() {
 		l = append(l, c.xtaggedExtComp())
 	}
 	return TaggedExtComp{Comps: l}
@@ -1019,7 +1322,7 @@ func (c *Conn) xtaggedExtComp() TaggedExtComp {
 // ../rfc/9051:6765
 func (c *Conn) xnamespace() []NamespaceDescr {
 	if !c.take('(') {
-		c.xtake("NIL")
+		c.xtake("nil")
 		return nil
 	}
 
@@ -1043,7 +1346,7 @@ func (c *Conn) xnamespaceDescr() NamespaceDescr {
 		}
 		b = byte(s[0])
 	} else {
-		c.xtake("NIL")
+		c.xtake("nil")
 	}
 	var exts []NamespaceExtension
 	for !c.take(')') {
@@ -1052,23 +1355,13 @@ func (c *Conn) xnamespaceDescr() NamespaceDescr {
 		c.xspace()
 		c.xtake("(")
 		values := []string{c.xstring()}
-		for c.take(' ') {
+		for c.space() {
 			values = append(values, c.xstring())
 		}
 		c.xtake(")")
 		exts = append(exts, NamespaceExtension{key, values})
 	}
 	return NamespaceDescr{prefix, b, exts}
-}
-
-// require one of caps to be enabled.
-func (c *Conn) xneedEnabled(msg string, caps ...Capability) {
-	for _, cap := range caps {
-		if _, ok := c.CapEnabled[cap]; ok {
-			return
-		}
-	}
-	c.xerrorf("%s: need one of following enabled capabilities: %v", msg, caps)
 }
 
 // require all of caps to be disabled.
@@ -1084,7 +1377,7 @@ func (c *Conn) xneedDisabled(msg string, caps ...Capability) {
 // Already consumed: "ESEARCH"
 func (c *Conn) xesearchResponse() (r UntaggedEsearch) {
 
-	if !c.take(' ') {
+	if !c.space() {
 		return
 	}
 	if c.take('(') {
@@ -1094,14 +1387,14 @@ func (c *Conn) xesearchResponse() (r UntaggedEsearch) {
 		r.Correlator = c.xastring()
 		c.xtake(")")
 	}
-	if !c.take(' ') {
+	if !c.space() {
 		return
 	}
 	w := c.xnonspace()
 	W := strings.ToUpper(w)
 	if W == "UID" {
 		r.UID = true
-		if !c.take(' ') {
+		if !c.space() {
 			return
 		}
 		w = c.xnonspace()
@@ -1145,6 +1438,11 @@ func (c *Conn) xesearchResponse() (r UntaggedEsearch) {
 			num := c.xuint32()
 			r.Count = &num
 
+		// ../rfc/7162:1211 ../rfc/4731:273
+		case "MODSEQ":
+			c.xspace()
+			r.ModSeq = c.xint64()
+
 		default:
 			// Validate ../rfc/9051:7090
 			for i, b := range []byte(w) {
@@ -1157,7 +1455,7 @@ func (c *Conn) xesearchResponse() (r UntaggedEsearch) {
 			r.Exts = append(r.Exts, ext)
 		}
 
-		if !c.take(' ') {
+		if !c.space() {
 			break
 		}
 		w = c.xnonspace() // todo: this is too loose

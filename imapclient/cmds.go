@@ -9,6 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mjl-/flate"
+
+	"github.com/mjl-/mox/mlog"
+	"github.com/mjl-/mox/moxio"
 	"github.com/mjl-/mox/scram"
 )
 
@@ -39,11 +43,14 @@ func (c *Conn) Starttls(config *tls.Config) (untagged []Untagged, result Result,
 	defer c.recover(&rerr)
 	untagged, result, rerr = c.Transactf("starttls")
 	c.xcheckf(rerr, "starttls command")
-	conn := tls.Client(c.conn, config)
-	err := conn.Handshake()
+
+	conn := c.xprefixConn()
+	tlsConn := tls.Client(conn, config)
+	err := tlsConn.Handshake()
 	c.xcheckf(err, "tls handshake")
-	c.conn = conn
-	c.r = bufio.NewReader(conn)
+	c.conn = tlsConn
+	c.br = bufio.NewReader(moxio.NewTraceReader(c.log, "CR: ", tlsConn))
+	c.bw = bufio.NewWriter(moxio.NewTraceWriter(c.log, "CW: ", c))
 	return untagged, result, nil
 }
 
@@ -61,13 +68,26 @@ func (c *Conn) AuthenticatePlain(username, password string) (untagged []Untagged
 	return
 }
 
-// Authenticate with SCRAM-SHA-1 or SCRAM-SHA-256, where the password is not
-// exchanged in original plaintext form, but only derived hashes are exchanged by
-// both parties as proof of knowledge of password.
+// Authenticate with SCRAM-SHA-256(-PLUS) or SCRAM-SHA-1(-PLUS). With SCRAM, the
+// password is not exchanged in plaintext form, but only derived hashes are
+// exchanged by both parties as proof of knowledge of password.
+//
+// The PLUS variants bind the authentication exchange to the TLS connection,
+// detecting MitM attacks.
 func (c *Conn) AuthenticateSCRAM(method string, h func() hash.Hash, username, password string) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
 
-	sc := scram.NewClient(h, username, "")
+	var cs *tls.ConnectionState
+	lmethod := strings.ToLower(method)
+	if strings.HasSuffix(lmethod, "-plus") {
+		tlsConn, ok := c.conn.(*tls.Conn)
+		if !ok {
+			c.xerrorf("cannot use scram plus without tls")
+		}
+		xcs := tlsConn.ConnectionState()
+		cs = &xcs
+	}
+	sc := scram.NewClient(h, username, "", false, cs)
 	clientFirst, err := sc.ClientFirst()
 	c.xcheckf(err, "scram clientFirst")
 	c.LastTag = c.nextTag()
@@ -103,6 +123,38 @@ func (c *Conn) AuthenticateSCRAM(method string, h func() hash.Hash, username, pa
 	return c.ResponseOK()
 }
 
+// CompressDeflate enables compression with deflate on the connection.
+//
+// Only possible when server has announced the COMPRESS=DEFLATE capability.
+//
+// State: Authenticated or selected.
+func (c *Conn) CompressDeflate() (untagged []Untagged, result Result, rerr error) {
+	defer c.recover(&rerr)
+
+	if _, ok := c.CapAvailable[CapCompressDeflate]; !ok {
+		c.xerrorf("server does not implement capability %s", CapCompressDeflate)
+	}
+
+	untagged, result, rerr = c.Transactf("compress deflate")
+	c.xcheck(rerr)
+
+	c.flateBW = bufio.NewWriter(c)
+	fw, err := flate.NewWriter(c.flateBW, flate.DefaultCompression)
+	c.xcheckf(err, "deflate") // Cannot happen.
+
+	c.compress = true
+	c.flateWriter = fw
+	tw := moxio.NewTraceWriter(mlog.New("imapclient", nil), "CW: ", fw)
+	c.bw = bufio.NewWriter(tw)
+
+	rc := c.xprefixConn()
+	fr := flate.NewReaderPartial(rc)
+	tr := moxio.NewTraceReader(mlog.New("imapclient", nil), "CR: ", fr)
+	c.br = bufio.NewReader(tr)
+
+	return
+}
+
 // Enable enables capabilities for use with the connection, verifying the server has indeed enabled them.
 func (c *Conn) Enable(capabilities ...string) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
@@ -136,9 +188,18 @@ func (c *Conn) Examine(mailbox string) (untagged []Untagged, result Result, rerr
 }
 
 // Create makes a new mailbox on the server.
-func (c *Conn) Create(mailbox string) (untagged []Untagged, result Result, rerr error) {
+// SpecialUse can only be used on servers that announced the CREATE-SPECIAL-USE
+// capability. Specify flags like \Archive, \Drafts, \Junk, \Sent, \Trash, \All.
+func (c *Conn) Create(mailbox string, specialUse []string) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
-	return c.Transactf("create %s", astring(mailbox))
+	if _, ok := c.CapAvailable[CapCreateSpecialUse]; !ok && len(specialUse) > 0 {
+		c.xerrorf("server does not implement create-special-use extension")
+	}
+	var useStr string
+	if len(specialUse) > 0 {
+		useStr = fmt.Sprintf(" USE (%s)", strings.Join(specialUse, " "))
+	}
+	return c.Transactf("create %s%s", astring(mailbox), useStr)
 }
 
 // Delete removes an entire mailbox and its messages.
@@ -193,10 +254,15 @@ func (c *Conn) Namespace() (untagged []Untagged, result Result, rerr error) {
 	return c.Transactf("namespace")
 }
 
-// Status requests information about a mailbox, such as number of messages, size, etc.
-func (c *Conn) Status(mailbox string) (untagged []Untagged, result Result, rerr error) {
+// Status requests information about a mailbox, such as number of messages, size,
+// etc. At least one attribute required.
+func (c *Conn) Status(mailbox string, attrs ...StatusAttr) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
-	return c.Transactf("status %s", astring(mailbox))
+	l := make([]string, len(attrs))
+	for i, a := range attrs {
+		l[i] = string(a)
+	}
+	return c.Transactf("status %s (%s)", astring(mailbox), strings.Join(l, " "))
 }
 
 // Append adds message to mailbox with flags and optional receive time.

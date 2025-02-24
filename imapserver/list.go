@@ -1,8 +1,9 @@
 package imapserver
 
 import (
+	"bytes"
 	"fmt"
-	"path/filepath"
+	"path"
 	"sort"
 	"strings"
 
@@ -58,8 +59,9 @@ func (c *conn) cmdList(tag, cmd string, p *parser) {
 	p.xspace()
 	patterns, isList := p.xmboxOrPat()
 	isExtended = isExtended || isList
-	var retSubscribed, retChildren, retSpecialUse bool
+	var retSubscribed, retChildren bool
 	var retStatusAttrs []string
+	var retMetadata []string
 	if p.take(" RETURN (") {
 		isExtended = true
 		// ../rfc/9051:6613 ../rfc/9051:6915 ../rfc/9051:7072 ../rfc/9051:6821 ../rfc/5819:95
@@ -79,7 +81,8 @@ func (c *conn) cmdList(tag, cmd string, p *parser) {
 				retChildren = true
 			case "SPECIAL-USE":
 				// ../rfc/6154:478
-				retSpecialUse = true
+				// We always include special-use mailbox flags. Mac OS X Mail 16.0 (sept 2023) does
+				// not ask for the flags, but does use them when given. ../rfc/6154:146
 			case "STATUS":
 				// ../rfc/9051:7072 ../rfc/5819:181
 				p.xspace()
@@ -87,6 +90,18 @@ func (c *conn) cmdList(tag, cmd string, p *parser) {
 				retStatusAttrs = []string{p.xstatusAtt()}
 				for p.take(" ") {
 					retStatusAttrs = append(retStatusAttrs, p.xstatusAtt())
+				}
+				p.xtake(")")
+			case "METADATA":
+				// ../rfc/9590:167
+				p.xspace()
+				p.xtake("(")
+				for {
+					s := p.xmetadataKey()
+					retMetadata = append(retMetadata, s)
+					if !p.space() {
+						break
+					}
 				}
 				p.xtake(")")
 			default:
@@ -116,6 +131,7 @@ func (c *conn) cmdList(tag, cmd string, p *parser) {
 	}
 	re := xmailboxPatternMatcher(reference, patterns)
 	var responseLines []string
+	var respMetadata []concatspace
 
 	c.account.WithRLock(func() {
 		c.xdbread(func(tx *bstore.Tx) {
@@ -132,7 +148,7 @@ func (c *conn) cmdList(tag, cmd string, p *parser) {
 			err := q.ForEach(func(mb store.Mailbox) error {
 				names[mb.Name] = info{mailbox: &mb}
 				nameList = append(nameList, mb.Name)
-				for p := filepath.Dir(mb.Name); p != "."; p = filepath.Dir(p) {
+				for p := path.Dir(mb.Name); p != "."; p = path.Dir(p) {
 					hasChild[p] = true
 				}
 				return nil
@@ -147,7 +163,7 @@ func (c *conn) cmdList(tag, cmd string, p *parser) {
 				if !ok {
 					nameList = append(nameList, sub.Name)
 				}
-				for p := filepath.Dir(sub.Name); p != "."; p = filepath.Dir(p) {
+				for p := path.Dir(sub.Name); p != "."; p = path.Dir(p) {
 					hasSubscribedChild[p] = true
 				}
 				return nil
@@ -189,33 +205,51 @@ func (c *conn) cmdList(tag, cmd string, p *parser) {
 				if !listSubscribed && retSubscribed && info.subscribed {
 					flags = append(flags, bare(`\Subscribed`))
 				}
-				if retSpecialUse && info.mailbox != nil {
-					if info.mailbox.Archive {
-						flags = append(flags, bare(`\Archive`))
+				if info.mailbox != nil {
+					add := func(b bool, v string) {
+						if b {
+							flags = append(flags, bare(v))
+						}
 					}
-					if info.mailbox.Draft {
-						flags = append(flags, bare(`\Draft`))
-					}
-					if info.mailbox.Junk {
-						flags = append(flags, bare(`\Junk`))
-					}
-					if info.mailbox.Sent {
-						flags = append(flags, bare(`\Sent`))
-					}
-					if info.mailbox.Trash {
-						flags = append(flags, bare(`\Trash`))
-					}
+					mb := info.mailbox
+					add(mb.Archive, `\Archive`)
+					add(mb.Draft, `\Drafts`)
+					add(mb.Junk, `\Junk`)
+					add(mb.Sent, `\Sent`)
+					add(mb.Trash, `\Trash`)
 				}
 
 				var extStr string
 				if extended != nil {
 					extStr = " " + extended.pack(c)
 				}
-				line := fmt.Sprintf(`* LIST %s "/" %s%s`, flags.pack(c), astring(name).pack(c), extStr)
+				line := fmt.Sprintf(`* LIST %s "/" %s%s`, flags.pack(c), mailboxt(name).pack(c), extStr)
 				responseLines = append(responseLines, line)
 
 				if retStatusAttrs != nil && info.mailbox != nil {
 					responseLines = append(responseLines, c.xstatusLine(tx, *info.mailbox, retStatusAttrs))
+				}
+
+				// ../rfc/9590:101
+				if info.mailbox != nil && len(retMetadata) > 0 {
+					var meta listspace
+					for _, k := range retMetadata {
+						a, err := bstore.QueryTx[store.Annotation](tx).FilterNonzero(store.Annotation{MailboxID: info.mailbox.ID, Key: k}).Get()
+						var v token
+						if err == bstore.ErrAbsent {
+							v = nilt
+						} else {
+							xcheckf(err, "get annotation")
+							if a.IsString {
+								v = string0(string(a.Value))
+							} else {
+								v = readerSizeSyncliteral{bytes.NewReader(a.Value), int64(len(a.Value)), true}
+							}
+						}
+						meta = append(meta, astring(k), v)
+					}
+					line := concatspace{bare("*"), bare("METADATA"), mailboxt(info.mailbox.Name), meta}
+					respMetadata = append(respMetadata, line)
 				}
 			}
 		})
@@ -223,6 +257,10 @@ func (c *conn) cmdList(tag, cmd string, p *parser) {
 
 	for _, line := range responseLines {
 		c.bwritelinef("%s", line)
+	}
+	for _, meta := range respMetadata {
+		meta.writeTo(c, c.bw)
+		c.bwritelinef("")
 	}
 	c.ok(tag, cmd)
 }
