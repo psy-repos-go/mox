@@ -162,7 +162,7 @@ func parseSection(t *doc.Type, pp *parsedPackage) *section {
 	st := expr.(*ast.StructType)
 	for _, f := range st.Fields.List {
 		ident, ok := f.Type.(*ast.Ident)
-		if !ok {
+		if !ok || !ast.IsExported(ident.Name) {
 			continue
 		}
 		name := ident.Name
@@ -181,15 +181,24 @@ func parseSection(t *doc.Type, pp *parsedPackage) *section {
 }
 
 // Ensure type "t" (used in a field or argument) defined in package pp is parsed
-// and added to the section.
-func ensureNamedType(t *doc.Type, sec *section, pp *parsedPackage) {
-	typePath := pp.Path + "." + t.Name
+// and added to the section. The returned string is the name as used in the
+// sherpadoc, it may have been renamed.
+func ensureNamedType(t *doc.Type, sec *section, pp *parsedPackage) (name string) {
+	if s, ok := renames[renameSrc{pp.Pkg.Name, t.Name}]; ok {
+		name = s
+		if sherpadoc.IsBasicType(s) {
+			return
+		}
+	} else {
+		name = t.Name
+	}
+	typePath := pp.Path + "." + name
 	if _, have := sec.Typeset[typePath]; have {
 		return
 	}
 
 	tt := &namedType{
-		Name: t.Name,
+		Name: name,
 		Text: strings.TrimSpace(t.Doc),
 	}
 	// add it early, so self-referencing types can't cause a loop
@@ -299,7 +308,7 @@ func ensureNamedType(t *doc.Type, sec *section, pp *parsedPackage) {
 
 		tt.Text = t.Doc + ts.Comment.Text()
 		switch nt.Name {
-		case "byte", "int16", "uint16", "int32", "uint32", "int", "uint":
+		case "byte", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "int", "uint":
 			tt.Kind = typeInts
 		case "string":
 			tt.Kind = typeStrings
@@ -331,13 +340,14 @@ func ensureNamedType(t *doc.Type, sec *section, pp *parsedPackage) {
 					if tt.Kind != typeInts {
 						logFatalLinef(pp, lit.Pos(), "int value for for non-int-enum %q", t.Name)
 					}
-					v, err := strconv.ParseInt(lit.Value, 10, 64)
+					// Given JSON/JS lack of integers, restrict to what it can represent in its float.
+					v, err := strconv.ParseInt(lit.Value, 10, 52)
 					check(err, "parse int literal")
 					iv := struct {
 						Name  string
-						Value int
+						Value int64
 						Docs  string
-					}{name, int(v), strings.TrimSpace(comment)}
+					}{name, v, strings.TrimSpace(comment)}
 					tt.IntValues = append(tt.IntValues, iv)
 				case token.STRING:
 					if tt.Kind != typeStrings {
@@ -359,6 +369,7 @@ func ensureNamedType(t *doc.Type, sec *section, pp *parsedPackage) {
 	default:
 		logFatalLinef(pp, t.Decl.TokPos, "unsupported field/param/return type %T", ts.Type)
 	}
+	return
 }
 
 func hasOmitEmpty(tag *ast.BasicLit) bool {
@@ -406,8 +417,8 @@ func gatherFieldType(typeName string, f *field, e ast.Expr, fieldTag *ast.BasicL
 	case *ast.Ident:
 		tt := pp.lookupType(t.Name)
 		if tt != nil {
-			ensureNamedType(tt, sec, pp)
-			return []string{t.Name}
+			name := ensureNamedType(tt, sec, pp)
+			return []string{name}
 		}
 		commaString := isCommaString(fieldTag)
 		name := t.Name
@@ -464,8 +475,8 @@ func parseArgType(e ast.Expr, sec *section, pp *parsedPackage) typewords {
 	case *ast.Ident:
 		tt := pp.lookupType(t.Name)
 		if tt != nil {
-			ensureNamedType(tt, sec, pp)
-			return []string{t.Name}
+			name := ensureNamedType(tt, sec, pp)
+			return []string{name}
 		}
 		name := t.Name
 		switch name {
@@ -537,6 +548,8 @@ func parseSelector(t *ast.SelectorExpr, srcTypeName string, sec *section, pp *pa
 
 	if pkgName == "time" && typeName == "Time" {
 		return "timestamp"
+	} else if pkgName == "time" && typeName == "Duration" {
+		return "int64"
 	}
 	if pkgName == "sherpa" {
 		switch typeName {
@@ -557,8 +570,7 @@ func parseSelector(t *ast.SelectorExpr, srcTypeName string, sec *section, pp *pa
 	if tt == nil {
 		logFatalLinef(pp, t.Pos(), "could not find type %q in package %q", typeName, importPath)
 	}
-	ensureNamedType(tt, sec, opp)
-	return typeName
+	return ensureNamedType(tt, sec, opp)
 }
 
 type replacement struct {
@@ -745,8 +757,8 @@ func (pp *parsedPackage) ensurePackageParsed(importPath string) *parsedPackage {
 	return npp
 }
 
-// LookupPackageImportPath returns the import/package path for pkgName as used as
-// used in the type named typeName.
+// LookupPackageImportPath returns the import/package path for pkgName as used
+// in the type named typeName.
 func (pp *parsedPackage) lookupPackageImportPath(typeName, pkgName string) string {
 	file := pp.lookupTypeFile(typeName)
 	for _, imp := range file.Imports {
@@ -757,7 +769,8 @@ func (pp *parsedPackage) lookupPackageImportPath(typeName, pkgName string) strin
 	return ""
 }
 
-// LookupTypeFile returns the go source file that containst he definition of the type named typeName.
+// LookupTypeFile returns the go source file that contains the definition of
+// the type named typeName.
 func (pp *parsedPackage) lookupTypeFile(typeName string) *ast.File {
 	for _, file := range pp.Pkg.Files {
 		for _, decl := range file.Decls {

@@ -13,26 +13,21 @@ LIST-EXTENDED, SPECIAL-USE, MOVE, UTF8=ONLY.
 
 We take a liberty with UTF8=ONLY. We are supposed to wait for ENABLE of
 UTF8=ACCEPT or IMAP4rev2 before we respond with quoted strings that contain
-non-ASCII UTF-8. But we will unconditionally accept UTF-8 at the moment. See
+non-ASCII UTF-8. Until that's enabled, we do use UTF-7 for mailbox names. See
 ../rfc/6855:251
-
-We always respond with utf8 mailbox names. We do parse utf7 (only in IMAP4rev1,
-not in IMAP4rev2). ../rfc/3501:964
 
 - We never execute multiple commands at the same time for a connection. We expect a client to open multiple connections instead. ../rfc/9051:1110
 - Do not write output on a connection with an account lock held. Writing can block, a slow client could block account operations.
 - When handling commands that modify the selected mailbox, always check that the mailbox is not opened readonly. And always revalidate the selected mailbox, another session may have deleted the mailbox.
 - After making changes to an account/mailbox/message, you must broadcast changes. You must do this with the account lock held. Otherwise, other later changes (e.g. message deliveries) may be made and broadcast before changes that were made earlier. Make sure to commit changes in the database first, because the commit may fail.
 - Mailbox hierarchies are slash separated, no leading slash. We keep the case, except INBOX is renamed to Inbox, also for submailboxes in INBOX. We don't allow existence of a child where its parent does not exist. We have no \NoInferiors or \NoSelect. Newly created mailboxes are automatically subscribed.
+- For CONDSTORE and QRESYNC support, we set "modseq" for each change/expunge. Once expunged, a modseq doesn't change anymore. We don't yet remove old expunged records. The records aren't too big. Next step may be to let an admin reclaim space manually.
 */
 
 /*
 - todo: do not return binary data for a fetch body. at least not for imap4rev1. we should be encoding it as base64?
 - todo: on expunge we currently remove the message even if other sessions still have a reference to the uid. if they try to query the uid, they'll get an error. we could be nicer and only actually remove the message when the last reference has gone. we could add a new flag to store.Message marking the message as expunged, not give new session access to such messages, and make store remove them at startup, and clean them when the last session referencing the session goes. however, it will get much more complicated. renaming messages would need special handling. and should we do the same for removed mailboxes?
-- todo: CONDSTORE, QRESYNC. Add fields modseq on mailbox and each message. Keep (log of) deleted messages and their modseqs.
 - todo: try to recover from syntax errors when the last command line ends with a }, i.e. a literal. we currently abort the entire connection. we may want to read some amount of literal data and continue with a next command.
-- future: more extensions: STATUS=SIZE, OBJECTID, MULTISEARCH, REPLACE, NOTIFY, CATENATE, MULTIAPPEND, SORT, THREAD, CREATE-SPECIAL-USE.
-- future: implement user-defined keyword flags? ../rfc/9051:566
 */
 
 import (
@@ -43,26 +38,35 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/exp/maps"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"golang.org/x/text/unicode/norm"
 
 	"github.com/mjl-/bstore"
+	"github.com/mjl-/flate"
 
 	"github.com/mjl-/mox/config"
 	"github.com/mjl-/mox/message"
@@ -75,10 +79,6 @@ import (
 	"github.com/mjl-/mox/scram"
 	"github.com/mjl-/mox/store"
 )
-
-// Most logging should be done through conn.log* functions.
-// Only use imaplog in contexts without connection.
-var xlog = mlog.New("imapserver")
 
 var (
 	metricIMAPConnection = promauto.NewCounterVec(
@@ -102,6 +102,8 @@ var (
 		},
 	)
 )
+
+var unhandledPanics atomic.Int64 // For tests.
 
 var limiterConnectionrate, limiterConnections *ratelimit.Limiter
 
@@ -147,37 +149,60 @@ var authFailDelay = time.Second  // After authentication failure.
 // MOVE: ../rfc/6851
 // UTF8=ONLY: ../rfc/6855
 // LIST-EXTENDED: ../rfc/5258
-// SPECIAL-USE: ../rfc/6154
+// SPECIAL-USE CREATE-SPECIAL-USE: ../rfc/6154
 // LIST-STATUS: ../rfc/5819
 // ID: ../rfc/2971
-// AUTH=SCRAM-SHA-256: ../rfc/7677 ../rfc/5802
-// AUTH=SCRAM-SHA-1: ../rfc/5802
+// AUTH=EXTERNAL: ../rfc/4422:1575
+// AUTH=SCRAM-SHA-256-PLUS and AUTH=SCRAM-SHA-256: ../rfc/7677 ../rfc/5802
+// AUTH=SCRAM-SHA-1-PLUS and AUTH=SCRAM-SHA-1: ../rfc/5802
 // AUTH=CRAM-MD5: ../rfc/2195
 // APPENDLIMIT, we support the max possible size, 1<<63 - 1: ../rfc/7889:129
-const serverCapabilities = "IMAP4rev2 IMAP4rev1 ENABLE LITERAL+ IDLE SASL-IR BINARY UNSELECT UIDPLUS ESEARCH SEARCHRES MOVE UTF8=ONLY LIST-EXTENDED SPECIAL-USE LIST-STATUS AUTH=SCRAM-SHA-256 AUTH=SCRAM-SHA-1 AUTH=CRAM-MD5 ID APPENDLIMIT=9223372036854775807"
+// CONDSTORE: ../rfc/7162:411
+// QRESYNC: ../rfc/7162:1323
+// STATUS=SIZE: ../rfc/8438 ../rfc/9051:8024
+// QUOTA QUOTA=RES-STORAGE: ../rfc/9208:111
+// METADATA: ../rfc/5464
+// SAVEDATE: ../rfc/8514
+// WITHIN: ../rfc/5032
+// NAMESPACE: ../rfc/2342
+// COMPRESS=DEFLATE: ../rfc/4978
+// LIST-METADATA: ../rfc/9590
+// MULTIAPPEND: ../rfc/3502
+// REPLACE: ../rfc/8508
+//
+// We always announce support for SCRAM PLUS-variants, also on connections without
+// TLS. The client should not be selecting PLUS variants on non-TLS connections,
+// instead opting to do the bare SCRAM variant without indicating the server claims
+// to support the PLUS variant (skipping the server downgrade detection check).
+const serverCapabilities = "IMAP4rev2 IMAP4rev1 ENABLE LITERAL+ IDLE SASL-IR BINARY UNSELECT UIDPLUS ESEARCH SEARCHRES MOVE UTF8=ACCEPT LIST-EXTENDED SPECIAL-USE CREATE-SPECIAL-USE LIST-STATUS AUTH=SCRAM-SHA-256-PLUS AUTH=SCRAM-SHA-256 AUTH=SCRAM-SHA-1-PLUS AUTH=SCRAM-SHA-1 AUTH=CRAM-MD5 ID APPENDLIMIT=9223372036854775807 CONDSTORE QRESYNC STATUS=SIZE QUOTA QUOTA=RES-STORAGE METADATA SAVEDATE WITHIN NAMESPACE COMPRESS=DEFLATE LIST-METADATA MULTIAPPEND REPLACE"
 
 type conn struct {
 	cid               int64
 	state             state
 	conn              net.Conn
+	connBroken        bool               // Once broken, we won't flush any more data.
 	tls               bool               // Whether TLS has been initialized.
-	br                *bufio.Reader      // From remote, with TLS unwrapped in case of TLS.
+	viaHTTPS          bool               // Whether this connection came in via HTTPS (using TLS ALPN).
+	br                *bufio.Reader      // From remote, with TLS unwrapped in case of TLS, and possibly wrapping inflate.
 	line              chan lineErr       // If set, instead of reading from br, a line is read from this channel. For reading a line in IDLE while also waiting for mailbox/account updates.
 	lastLine          string             // For detecting if syntax error is fatal, i.e. if this ends with a literal. Without crlf.
-	bw                *bufio.Writer      // To remote, with TLS added in case of TLS.
+	bw                *bufio.Writer      // To remote, with TLS added in case of TLS, and possibly wrapping deflate, see conn.flateWriter.
 	tr                *moxio.TraceReader // Kept to change trace level when reading/writing cmd/auth/data.
 	tw                *moxio.TraceWriter
 	slow              bool        // If set, reads are done with a 1 second sleep, and writes are done 1 byte at a time, to keep spammers busy.
 	lastlog           time.Time   // For printing time since previous log line.
-	tlsConfig         *tls.Config // TLS config to use for handshake.
+	baseTLSConfig     *tls.Config // Base TLS config to use for handshake.
 	remoteIP          net.IP
 	noRequireSTARTTLS bool
 	cmd               string // Currently executing, for deciding to applyChanges and logging.
 	cmdMetric         string // Currently executing, for metrics.
 	cmdStart          time.Time
-	ncmds             int // Number of commands processed. Used to abort connection when first incoming command is unknown/invalid.
-	log               *mlog.Log
+	ncmds             int                 // Number of commands processed. Used to abort connection when first incoming command is unknown/invalid.
+	log               mlog.Log            // Used for all synchronous logging on this connection, see logbg for logging in a separate goroutine.
 	enabled           map[capability]bool // All upper-case.
+	compress          bool                // Whether compression is enabled, via compress command.
+	flateWriter       *moxio.FlateWriter  // For flushing output after flushing conn.bw, and for closing.
+	flateBW           *bufio.Writer       // Wraps raw connection writes, flateWriter writes here, also needs flushing.
 
 	// Set by SEARCH with SAVE. Can be used by commands accepting a sequence-set with
 	// value "$". When used, UIDs must be verified to still exist, because they may
@@ -187,8 +212,20 @@ type conn struct {
 	// ../rfc/5182:13 ../rfc/9051:4040
 	searchResult []store.UID
 
-	// Only when authenticated.
+	// userAgent is set by the ID command, which can happen at any time (before or
+	// after the authentication attempt we want to log it with).
+	userAgent string
+	// loginAttempt is set during authentication, typically picked up by the ID command
+	// that soon follows, or it will be flushed within 1s, or on connection teardown.
+	loginAttempt     *store.LoginAttempt
+	loginAttemptTime time.Time
+
+	// Only set when connection has been authenticated. These can be set even when
+	// c.state is stateNotAuthenticated, for TLS client certificate authentication. In
+	// that case, credentials aren't used until the authentication command with the
+	// SASL "EXTERNAL" mechanism.
 	authFailed int    // Number of failed auth attempts. For slowing down remote with many failures.
+	noPreauth  bool   // If set, don't switch connection to "authenticated" after TLS handshake with client certificate authentication.
 	username   string // Full username as used during login.
 	account    *store.Account
 	comm       *store.Comm // For sending/receiving changes on mailboxes in account, e.g. from messages incoming on smtp, or another imap client.
@@ -206,6 +243,9 @@ type capability string
 const (
 	capIMAP4rev2  capability = "IMAP4REV2"
 	capUTF8Accept capability = "UTF8=ACCEPT"
+	capCondstore  capability = "CONDSTORE"
+	capQresync    capability = "QRESYNC"
+	capMetadata   capability = "METADATA"
 )
 
 type lineErr struct {
@@ -232,8 +272,8 @@ func stateCommands(cmds ...string) map[string]struct{} {
 var (
 	commandsStateAny              = stateCommands("capability", "noop", "logout", "id")
 	commandsStateNotAuthenticated = stateCommands("starttls", "authenticate", "login")
-	commandsStateAuthenticated    = stateCommands("enable", "select", "examine", "create", "delete", "rename", "subscribe", "unsubscribe", "list", "namespace", "status", "append", "idle", "lsub")
-	commandsStateSelected         = stateCommands("close", "unselect", "expunge", "search", "fetch", "store", "copy", "move", "uid expunge", "uid search", "uid fetch", "uid store", "uid copy", "uid move")
+	commandsStateAuthenticated    = stateCommands("enable", "select", "examine", "create", "delete", "rename", "subscribe", "unsubscribe", "list", "namespace", "status", "append", "idle", "lsub", "getquotaroot", "getquota", "getmetadata", "setmetadata", "compress")
+	commandsStateSelected         = stateCommands("close", "unselect", "expunge", "search", "fetch", "store", "copy", "move", "uid expunge", "uid search", "uid fetch", "uid store", "uid copy", "uid move", "replace", "uid replace")
 )
 
 var commands = map[string]func(c *conn, tag, cmd string, p *parser){
@@ -249,20 +289,25 @@ var commands = map[string]func(c *conn, tag, cmd string, p *parser){
 	"login":        (*conn).cmdLogin,
 
 	// Authenticated and selected.
-	"enable":      (*conn).cmdEnable,
-	"select":      (*conn).cmdSelect,
-	"examine":     (*conn).cmdExamine,
-	"create":      (*conn).cmdCreate,
-	"delete":      (*conn).cmdDelete,
-	"rename":      (*conn).cmdRename,
-	"subscribe":   (*conn).cmdSubscribe,
-	"unsubscribe": (*conn).cmdUnsubscribe,
-	"list":        (*conn).cmdList,
-	"lsub":        (*conn).cmdLsub,
-	"namespace":   (*conn).cmdNamespace,
-	"status":      (*conn).cmdStatus,
-	"append":      (*conn).cmdAppend,
-	"idle":        (*conn).cmdIdle,
+	"enable":       (*conn).cmdEnable,
+	"select":       (*conn).cmdSelect,
+	"examine":      (*conn).cmdExamine,
+	"create":       (*conn).cmdCreate,
+	"delete":       (*conn).cmdDelete,
+	"rename":       (*conn).cmdRename,
+	"subscribe":    (*conn).cmdSubscribe,
+	"unsubscribe":  (*conn).cmdUnsubscribe,
+	"list":         (*conn).cmdList,
+	"lsub":         (*conn).cmdLsub,
+	"namespace":    (*conn).cmdNamespace,
+	"status":       (*conn).cmdStatus,
+	"append":       (*conn).cmdAppend,
+	"idle":         (*conn).cmdIdle,
+	"getquotaroot": (*conn).cmdGetquotaroot,
+	"getquota":     (*conn).cmdGetquota,
+	"getmetadata":  (*conn).cmdGetmetadata,
+	"setmetadata":  (*conn).cmdSetmetadata,
+	"compress":     (*conn).cmdCompress,
 
 	// Selected.
 	"check":       (*conn).cmdCheck,
@@ -280,10 +325,13 @@ var commands = map[string]func(c *conn, tag, cmd string, p *parser){
 	"uid copy":    (*conn).cmdUIDCopy,
 	"move":        (*conn).cmdMove,
 	"uid move":    (*conn).cmdUIDMove,
+	// ../rfc/8508:289
+	"replace":     (*conn).cmdReplace,
+	"uid replace": (*conn).cmdUIDReplace,
 }
 
-var errIO = errors.New("fatal io error")             // For read/write errors and errors that should close the connection.
-var errProtocol = errors.New("fatal protocol error") // For protocol errors for which a stack trace should be printed.
+var errIO = errors.New("io error")             // For read/write errors and errors that should close the connection.
+var errProtocol = errors.New("protocol error") // For protocol errors for which a stack trace should be printed.
 
 var sanityChecks bool
 
@@ -299,11 +347,20 @@ func (c *conn) xsanity(err error, format string, args ...any) {
 	c.log.Errorx(fmt.Sprintf(format, args...), err)
 }
 
+func (c *conn) xbrokenf(format string, args ...any) {
+	c.connBroken = true
+	panic(fmt.Errorf(format, args...))
+}
+
 type msgseq uint32
 
 // Listen initializes all imap listeners for the configuration, and stores them for Serve to start them.
 func Listen() {
-	for name, listener := range mox.Conf.Static.Listeners {
+	names := maps.Keys(mox.Conf.Static.Listeners)
+	sort.Strings(names)
+	for _, name := range names {
+		listener := mox.Conf.Static.Listeners[name]
+
 		var tlsConfig *tls.Config
 		if listener.TLS != nil {
 			tlsConfig = listener.TLS.Config
@@ -328,33 +385,52 @@ func Listen() {
 var servers []func()
 
 func listen1(protocol, listenerName, ip string, port int, tlsConfig *tls.Config, xtls, noRequireSTARTTLS bool) {
+	log := mlog.New("imapserver", nil)
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 	if os.Getuid() == 0 {
-		xlog.Print("listening for imap", mlog.Field("listener", listenerName), mlog.Field("addr", addr), mlog.Field("protocol", protocol))
+		log.Print("listening for imap",
+			slog.String("listener", listenerName),
+			slog.String("addr", addr),
+			slog.String("protocol", protocol))
 	}
 	network := mox.Network(ip)
 	ln, err := mox.Listen(network, addr)
 	if err != nil {
-		xlog.Fatalx("imap: listen for imap", err, mlog.Field("protocol", protocol), mlog.Field("listener", listenerName))
+		log.Fatalx("imap: listen for imap", err, slog.String("protocol", protocol), slog.String("listener", listenerName))
 	}
-	if xtls {
-		ln = tls.NewListener(ln, tlsConfig)
+
+	// Each listener gets its own copy of the config, so session keys between different
+	// ports on same listener aren't shared. We rotate session keys explicitly in this
+	// base TLS config because each connection clones the TLS config before using. The
+	// base TLS config would never get automatically managed/rotated session keys.
+	if tlsConfig != nil {
+		tlsConfig = tlsConfig.Clone()
+		mox.StartTLSSessionTicketKeyRefresher(mox.Shutdown, log, tlsConfig)
 	}
 
 	serve := func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				xlog.Infox("imap: accept", err, mlog.Field("protocol", protocol), mlog.Field("listener", listenerName))
+				log.Infox("imap: accept", err, slog.String("protocol", protocol), slog.String("listener", listenerName))
 				continue
 			}
 
 			metricIMAPConnection.WithLabelValues(protocol).Inc()
-			go serve(listenerName, mox.Cid(), tlsConfig, conn, xtls, noRequireSTARTTLS)
+			go serve(listenerName, mox.Cid(), tlsConfig, conn, xtls, noRequireSTARTTLS, false, "")
 		}
 	}
 
 	servers = append(servers, serve)
+}
+
+// ServeTLSConn serves IMAP on a TLS connection.
+func ServeTLSConn(listenerName string, conn *tls.Conn, tlsConfig *tls.Config) {
+	serve(listenerName, mox.Cid(), tlsConfig, conn, true, false, true, "")
+}
+
+func ServeConnPreauth(listenerName string, cid int64, conn net.Conn, preauthAddress string) {
+	serve(listenerName, cid, nil, conn, false, true, false, preauthAddress)
 }
 
 // Serve starts serving on all listeners, launching a goroutine per listener.
@@ -363,6 +439,18 @@ func Serve() {
 		go serve()
 	}
 	servers = nil
+}
+
+// Logbg returns a logger for logging in the background (in a goroutine), eg for
+// logging LoginAttempts. The regular c.log has a handler that evaluates fields on
+// the connection at time of logging, which may happen at the same time as
+// modifications to those fields.
+func (c *conn) logbg() mlog.Log {
+	log := mlog.New("imapserver", nil).WithCid(c.cid)
+	if c.username != "" {
+		log = log.With(slog.String("username", c.username))
+	}
+	return log
 }
 
 // returns whether this connection accepts utf-8 in strings.
@@ -420,7 +508,7 @@ func (c *conn) Write(buf []byte) (int, error) {
 
 		nn, err := c.conn.Write(buf[:chunk])
 		if err != nil {
-			panic(fmt.Errorf("write: %s (%w)", err, errIO))
+			c.xbrokenf("write: %s (%w)", err, errIO)
 		}
 		n += nn
 		buf = buf[chunk:]
@@ -431,7 +519,7 @@ func (c *conn) Write(buf []byte) (int, error) {
 	return n, nil
 }
 
-func (c *conn) xtrace(level mlog.Level) func() {
+func (c *conn) xtrace(level slog.Level) func() {
 	c.xflush()
 	c.tr.SetTrace(level)
 	c.tw.SetTrace(level)
@@ -443,6 +531,7 @@ func (c *conn) xtrace(level mlog.Level) func() {
 }
 
 // Cache of line buffers for reading commands.
+// QRESYNC recommends 8k max line lengths. ../rfc/7162:2159
 var bufpool = moxio.NewBufpool(8, 16*1024)
 
 // read line from connection, not going through line channel.
@@ -458,10 +547,11 @@ func (c *conn) readline0() (string, error) {
 	err := c.conn.SetReadDeadline(time.Now().Add(d))
 	c.log.Check(err, "setting read deadline")
 
-	line, err := bufpool.Readline(c.br)
+	line, err := bufpool.Readline(c.log, c.br)
 	if err != nil && errors.Is(err, moxio.ErrLineTooLong) {
 		return "", fmt.Errorf("%s (%w)", err, errProtocol)
 	} else if err != nil {
+		c.connBroken = true
 		return "", fmt.Errorf("%s (%w)", err, errIO)
 	}
 	return line, nil
@@ -496,7 +586,7 @@ func (c *conn) readline(readCmd bool) string {
 			c.writelinef("* BYE inactive")
 		}
 		if !errors.Is(err, errIO) && !errors.Is(err, errProtocol) {
-			err = fmt.Errorf("%s (%w)", err, errIO)
+			c.xbrokenf("%s (%w)", err, errIO)
 		}
 		panic(err)
 	}
@@ -523,11 +613,11 @@ func (c *conn) writeresultf(format string, args ...any) {
 	c.xflush()
 }
 
-// write buffered taggedcommand response, but first write pending changes.
+// write buffered tagged command response, but first write pending changes.
 func (c *conn) bwriteresultf(format string, args ...any) {
 	switch c.cmd {
 	case "fetch", "store", "search":
-		// ../rfc/9051:5862
+		// ../rfc/9051:5862 ../rfc/7162:2033
 	default:
 		if c.comm != nil {
 			c.applyChanges(c.comm.Get(), false)
@@ -548,8 +638,26 @@ func (c *conn) bwritelinef(format string, args ...any) {
 }
 
 func (c *conn) xflush() {
+	// If the connection is already broken, we're not going to write more.
+	if c.connBroken {
+		return
+	}
+
 	err := c.bw.Flush()
 	xcheckf(err, "flush") // Should never happen, the Write caused by the Flush should panic on i/o error.
+
+	// If compression is enabled, we need to flush its stream.
+	if c.compress {
+		// Note: Flush writes a sync message if there is nothing to flush. Ideally we
+		// wouldn't send that, but we would have to keep track of whether data needs to be
+		// flushed.
+		err := c.flateWriter.Flush()
+		xcheckf(err, "flush deflate")
+
+		// The flate writer writes to a bufio.Writer, we must also flush that.
+		err = c.flateBW.Flush()
+		xcheckf(err, "flush deflate writer")
+	}
 }
 
 func (c *conn) readCommand(tag *string) (cmd string, p *parser) {
@@ -563,9 +671,9 @@ func (c *conn) readCommand(tag *string) (cmd string, p *parser) {
 	return cmd, newParser(p.remainder(), c)
 }
 
-func (c *conn) xreadliteral(size int64, sync bool) string {
+func (c *conn) xreadliteral(size int64, sync bool) []byte {
 	if sync {
-		c.writelinef("+")
+		c.writelinef("+ ")
 	}
 	buf := make([]byte, size)
 	if size > 0 {
@@ -575,21 +683,34 @@ func (c *conn) xreadliteral(size int64, sync bool) string {
 
 		_, err := io.ReadFull(c.br, buf)
 		if err != nil {
-			// Cannot use xcheckf due to %w handling of errIO.
-			panic(fmt.Errorf("reading literal: %s (%w)", err, errIO))
+			c.xbrokenf("reading literal: %s (%w)", err, errIO)
 		}
 	}
-	return string(buf)
+	return buf
 }
 
 var cleanClose struct{} // Sentinel value for panic/recover indicating clean close of connection.
 
-func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, xtls, noRequireSTARTTLS bool) {
+// serve handles a single IMAP connection on nc.
+//
+// If xtls is set, immediate TLS should be enabled on the connection, unless
+// viaHTTP is set, which indicates TLS is already active with the connection coming
+// from the webserver with IMAP chosen through ALPN. activated. If viaHTTP is set,
+// the TLS config ddid not enable client certificate authentication. If xtls is
+// false and tlsConfig is set, STARTTLS may enable TLS later on.
+//
+// If noRequireSTARTTLS is set, TLS is not required for authentication.
+//
+// If accountAddress is not empty, it is the email address of the account to open
+// preauthenticated.
+//
+// The connection is closed before returning.
+func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, xtls, noRequireSTARTTLS, viaHTTPS bool, preauthAddress string) {
 	var remoteIP net.IP
 	if a, ok := nc.RemoteAddr().(*net.TCPAddr); ok {
 		remoteIP = a.IP
 	} else {
-		// For net.Pipe, during tests.
+		// For tests and for imapserve.
 		remoteIP = net.ParseIP("127.0.0.10")
 	}
 
@@ -597,51 +718,64 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 		cid:               cid,
 		conn:              nc,
 		tls:               xtls,
+		viaHTTPS:          viaHTTPS,
 		lastlog:           time.Now(),
-		tlsConfig:         tlsConfig,
+		baseTLSConfig:     tlsConfig,
 		remoteIP:          remoteIP,
 		noRequireSTARTTLS: noRequireSTARTTLS,
 		enabled:           map[capability]bool{},
 		cmd:               "(greeting)",
 		cmdStart:          time.Now(),
 	}
-	c.log = xlog.MoreFields(func() []mlog.Pair {
+	var logmutex sync.Mutex
+	// Also see (and possibly update) c.logbg, for logging in a goroutine.
+	c.log = mlog.New("imapserver", nil).WithFunc(func() []slog.Attr {
+		logmutex.Lock()
+		defer logmutex.Unlock()
 		now := time.Now()
-		l := []mlog.Pair{
-			mlog.Field("cid", c.cid),
-			mlog.Field("delta", now.Sub(c.lastlog)),
+		l := []slog.Attr{
+			slog.Int64("cid", c.cid),
+			slog.Duration("delta", now.Sub(c.lastlog)),
 		}
 		c.lastlog = now
 		if c.username != "" {
-			l = append(l, mlog.Field("username", c.username))
+			l = append(l, slog.String("username", c.username))
 		}
 		return l
 	})
 	c.tr = moxio.NewTraceReader(c.log, "C: ", c.conn)
-	c.tw = moxio.NewTraceWriter(c.log, "S: ", c)
 	// todo: tracing should be done on whatever comes out of c.br. the remote connection write a command plus data, and bufio can read it in one read, causing a command parser that sets the tracing level to data to have no effect. we are now typically logging sent messages, when mail clients append to the Sent mailbox.
 	c.br = bufio.NewReader(c.tr)
+	c.tw = moxio.NewTraceWriter(c.log, "S: ", c)
 	c.bw = bufio.NewWriter(c.tw)
 
 	// Many IMAP connections use IDLE to wait for new incoming messages. We'll enable
 	// keepalive to get a higher chance of the connection staying alive, or otherwise
 	// detecting broken connections early.
-	xconn := c.conn
-	if xtls {
-		xconn = c.conn.(*tls.Conn).NetConn()
+	tcpconn := c.conn
+	if viaHTTPS {
+		tcpconn = nc.(*tls.Conn).NetConn()
 	}
-	if tcpconn, ok := xconn.(*net.TCPConn); ok {
-		if err := tcpconn.SetKeepAlivePeriod(5 * time.Minute); err != nil {
+	if tc, ok := tcpconn.(*net.TCPConn); ok {
+		if err := tc.SetKeepAlivePeriod(5 * time.Minute); err != nil {
 			c.log.Errorx("setting keepalive period", err)
-		} else if err := tcpconn.SetKeepAlive(true); err != nil {
+		} else if err := tc.SetKeepAlive(true); err != nil {
 			c.log.Errorx("enabling keepalive", err)
 		}
 	}
 
-	c.log.Info("new connection", mlog.Field("remote", c.conn.RemoteAddr()), mlog.Field("local", c.conn.LocalAddr()), mlog.Field("tls", xtls), mlog.Field("listener", listenerName))
+	c.log.Info("new connection",
+		slog.Any("remote", c.conn.RemoteAddr()),
+		slog.Any("local", c.conn.LocalAddr()),
+		slog.Bool("tls", xtls),
+		slog.Bool("viahttps", viaHTTPS),
+		slog.String("listener", listenerName))
 
 	defer func() {
-		c.conn.Close()
+		err := c.conn.Close()
+		if err != nil {
+			c.log.Debugx("closing connection", err)
+		}
 
 		if c.account != nil {
 			c.comm.Unregister()
@@ -657,11 +791,18 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 		} else if err, ok := x.(error); ok && isClosed(err) {
 			c.log.Infox("connection closed", err)
 		} else {
-			c.log.Error("unhandled panic", mlog.Field("err", x))
+			c.log.Error("unhandled panic", slog.Any("err", x))
 			debug.PrintStack()
-			metrics.PanicInc("imapserver")
+			metrics.PanicInc(metrics.Imapserver)
+			unhandledPanics.Add(1) // For tests.
 		}
 	}()
+
+	if xtls && !viaHTTPS {
+		// Start TLS on connection. We perform the handshake explicitly, so we can set a
+		// timeout, do client certificate authentication, log TLS details afterwards.
+		c.xtlsHandshakeAndAuthenticate(c.conn)
+	}
 
 	select {
 	case <-mox.Shutdown.Done():
@@ -679,13 +820,13 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 	// If remote IP/network resulted in too many authentication failures, refuse to serve.
 	if !mox.LimiterFailedAuth.CanAdd(c.remoteIP, time.Now(), 1) {
 		metrics.AuthenticationRatelimitedInc("imap")
-		c.log.Debug("refusing connection due to many auth failures", mlog.Field("remoteip", c.remoteIP))
+		c.log.Debug("refusing connection due to many auth failures", slog.Any("remoteip", c.remoteIP))
 		c.writelinef("* BYE too many auth failures")
 		return
 	}
 
 	if !limiterConnections.Add(c.remoteIP, time.Now(), 1) {
-		c.log.Debug("refusing connection due to many open connections", mlog.Field("remoteip", c.remoteIP))
+		c.log.Debug("refusing connection due to many open connections", slog.Any("remoteip", c.remoteIP))
 		c.writelinef("* BYE too many open connections from your ip or network")
 		return
 	}
@@ -696,11 +837,45 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 	mox.Connections.Register(nc, "imap", listenerName)
 	defer mox.Connections.Unregister(nc)
 
-	c.writelinef("* OK [CAPABILITY %s] mox imap", c.capabilities())
+	if preauthAddress != "" {
+		acc, _, _, err := store.OpenEmail(c.log, preauthAddress, false)
+		if err != nil {
+			c.log.Debugx("open account for preauth address", err, slog.String("address", preauthAddress))
+			c.writelinef("* BYE open account for address: %s", err)
+			return
+		}
+		c.username = preauthAddress
+		c.account = acc
+		c.comm = store.RegisterComm(c.account)
+	}
+
+	if c.account != nil && !c.noPreauth {
+		c.state = stateAuthenticated
+		c.writelinef("* PREAUTH [CAPABILITY %s] mox imap welcomes %s", c.capabilities(), c.username)
+	} else {
+		c.writelinef("* OK [CAPABILITY %s] mox imap", c.capabilities())
+	}
+
+	// Ensure any pending loginAttempt is written before we stop.
+	defer func() {
+		if c.loginAttempt != nil {
+			store.LoginAttemptAdd(context.Background(), c.logbg(), *c.loginAttempt)
+			c.loginAttempt = nil
+			c.loginAttemptTime = time.Time{}
+		}
+	}()
 
 	for {
 		c.command()
-		c.xflush() // For flushing errors, or possibly commands that did not flush explicitly.
+		c.xflush() // For flushing errors, or commands that did not flush explicitly.
+
+		// Flush login attempt if it hasn't already been flushed by an ID command within 1s
+		// after authentication.
+		if c.loginAttempt != nil && (c.loginAttempt.UserAgent != "" || time.Since(c.loginAttemptTime) >= time.Second) {
+			store.LoginAttemptAdd(context.Background(), c.logbg(), *c.loginAttempt)
+			c.loginAttempt = nil
+			c.loginAttemptTime = time.Time{}
+		}
 	}
 }
 
@@ -708,6 +883,239 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 // For connection errors, we often want to generate fewer logs.
 func isClosed(err error) bool {
 	return errors.Is(err, errIO) || errors.Is(err, errProtocol) || moxio.IsClosed(err)
+}
+
+// newLoginAttempt initializes a c.loginAttempt, for adding to the store after
+// filling in the results and other details.
+func (c *conn) newLoginAttempt(useTLS bool, authMech string) {
+	if c.loginAttempt != nil {
+		store.LoginAttemptAdd(context.Background(), c.logbg(), *c.loginAttempt)
+		c.loginAttempt = nil
+	}
+	c.loginAttemptTime = time.Now()
+
+	var state *tls.ConnectionState
+	if tc, ok := c.conn.(*tls.Conn); ok && useTLS {
+		v := tc.ConnectionState()
+		state = &v
+	}
+
+	localAddr := c.conn.LocalAddr().String()
+	localIP, _, _ := net.SplitHostPort(localAddr)
+	if localIP == "" {
+		localIP = localAddr
+	}
+
+	c.loginAttempt = &store.LoginAttempt{
+		RemoteIP:  c.remoteIP.String(),
+		LocalIP:   localIP,
+		TLS:       store.LoginAttemptTLS(state),
+		Protocol:  "imap",
+		UserAgent: c.userAgent, // May still be empty, to be filled in later.
+		AuthMech:  authMech,
+		Result:    store.AuthError, // Replaced by caller.
+	}
+}
+
+// makeTLSConfig makes a new tls config that is bound to the connection for
+// possible client certificate authentication.
+func (c *conn) makeTLSConfig() *tls.Config {
+	// We clone the config so we can set VerifyPeerCertificate below to a method bound
+	// to this connection. Earlier, we set session keys explicitly on the base TLS
+	// config, so they can be used for this connection too.
+	tlsConf := c.baseTLSConfig.Clone()
+
+	// Allow client certificate authentication, for use with the sasl "external"
+	// authentication mechanism.
+	tlsConf.ClientAuth = tls.RequestClientCert
+
+	// We verify the client certificate during the handshake. The TLS handshake is
+	// initiated explicitly for incoming connections and during starttls, so we can
+	// immediately extract the account name and address used for authentication.
+	tlsConf.VerifyPeerCertificate = c.tlsClientAuthVerifyPeerCert
+
+	return tlsConf
+}
+
+// tlsClientAuthVerifyPeerCert can be used as tls.Config.VerifyPeerCertificate, and
+// sets authentication-related fields on conn. This is not called on resumed TLS
+// connections.
+func (c *conn) tlsClientAuthVerifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+	if len(rawCerts) == 0 {
+		return nil
+	}
+
+	// If we had too many authentication failures from this IP, don't attempt
+	// authentication. If this is a new incoming connetion, it is closed after the TLS
+	// handshake.
+	if !mox.LimiterFailedAuth.CanAdd(c.remoteIP, time.Now(), 1) {
+		return nil
+	}
+
+	cert, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		c.log.Debugx("parsing tls client certificate", err)
+		return err
+	}
+	if err := c.tlsClientAuthVerifyPeerCertParsed(cert); err != nil {
+		c.log.Debugx("verifying tls client certificate", err)
+		return fmt.Errorf("verifying client certificate: %w", err)
+	}
+	return nil
+}
+
+// tlsClientAuthVerifyPeerCertParsed verifies a client certificate. Called both for
+// fresh and resumed TLS connections.
+func (c *conn) tlsClientAuthVerifyPeerCertParsed(cert *x509.Certificate) error {
+	if c.account != nil {
+		return fmt.Errorf("cannot authenticate with tls client certificate after previous authentication")
+	}
+
+	// todo: it would be nice to postpone storing the loginattempt for tls pubkey auth until we have the ID command. but delaying is complicated because we can't get the tls information in this function. that's why we store the login attempt in a goroutine below, where it can can get a lock when accessing the tls connection only when this function has returned. we can't access c.loginAttempt (we would turn it into a slice) in a goroutine without adding more locking. for now we'll do without user-agent/id for tls pub key auth.
+	c.newLoginAttempt(false, "tlsclientauth")
+	defer func() {
+		// Get TLS connection state in goroutine because we are called while performing the
+		// TLS handshake, which already has the tls connection locked.
+		conn := c.conn.(*tls.Conn)
+		la := *c.loginAttempt
+		c.loginAttempt = nil
+		logbg := c.logbg() // Evaluate attributes now, can't do it in goroutine.
+		go func() {
+			defer func() {
+				// In case of panic don't take the whole program down.
+				x := recover()
+				if x != nil {
+					c.log.Error("recover from panic", slog.Any("panic", x))
+					debug.PrintStack()
+					metrics.PanicInc(metrics.Imapserver)
+				}
+			}()
+
+			state := conn.ConnectionState()
+			la.TLS = store.LoginAttemptTLS(&state)
+			store.LoginAttemptAdd(context.Background(), logbg, la)
+		}()
+
+		if la.Result == store.AuthSuccess {
+			mox.LimiterFailedAuth.Reset(c.remoteIP, time.Now())
+		} else {
+			mox.LimiterFailedAuth.Add(c.remoteIP, time.Now(), 1)
+		}
+	}()
+
+	// For many failed auth attempts, slow down verification attempts.
+	if c.authFailed > 3 && authFailDelay > 0 {
+		mox.Sleep(mox.Context, time.Duration(c.authFailed-3)*authFailDelay)
+	}
+	c.authFailed++ // Compensated on success.
+	defer func() {
+		// On the 3rd failed authentication, start responding slowly. Successful auth will
+		// cause fast responses again.
+		if c.authFailed >= 3 {
+			c.setSlow(true)
+		}
+	}()
+
+	shabuf := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	fp := base64.RawURLEncoding.EncodeToString(shabuf[:])
+	c.loginAttempt.TLSPubKeyFingerprint = fp
+	pubKey, err := store.TLSPublicKeyGet(context.TODO(), fp)
+	if err != nil {
+		if err == bstore.ErrAbsent {
+			c.loginAttempt.Result = store.AuthBadCredentials
+		}
+		return fmt.Errorf("looking up tls public key with fingerprint %s: %v", fp, err)
+	}
+	c.loginAttempt.LoginAddress = pubKey.LoginAddress
+
+	// Verify account exists and still matches address. We don't check for account
+	// login being disabled if preauth is disabled. In that case, sasl external auth
+	// will be done before credentials can be used, and login disabled will be checked
+	// then, where it will result in a more helpful error message.
+	checkLoginDisabled := !pubKey.NoIMAPPreauth
+	acc, accName, _, err := store.OpenEmail(c.log, pubKey.LoginAddress, checkLoginDisabled)
+	c.loginAttempt.AccountName = accName
+	if err != nil {
+		if errors.Is(err, store.ErrLoginDisabled) {
+			c.loginAttempt.Result = store.AuthLoginDisabled
+		}
+		// note: we cannot send a more helpful error message to the client.
+		return fmt.Errorf("opening account for address %s for public key %s: %w", pubKey.LoginAddress, fp, err)
+	}
+	defer func() {
+		if acc != nil {
+			err := acc.Close()
+			c.xsanity(err, "close account")
+		}
+	}()
+	c.loginAttempt.AccountName = acc.Name
+	if acc.Name != pubKey.Account {
+		return fmt.Errorf("tls client public key %s is for account %s, but email address %s is for account %s", fp, pubKey.Account, pubKey.LoginAddress, acc.Name)
+	}
+
+	c.loginAttempt.Result = store.AuthSuccess
+
+	c.authFailed = 0
+	c.noPreauth = pubKey.NoIMAPPreauth
+	c.account = acc
+	acc = nil // Prevent cleanup by defer.
+	c.username = pubKey.LoginAddress
+	c.comm = store.RegisterComm(c.account)
+	c.log.Debug("tls client authenticated with client certificate",
+		slog.String("fingerprint", fp),
+		slog.String("username", c.username),
+		slog.String("account", c.account.Name),
+		slog.Any("remote", c.remoteIP))
+	return nil
+}
+
+// xtlsHandshakeAndAuthenticate performs the TLS handshake, and verifies a client
+// certificate if present.
+func (c *conn) xtlsHandshakeAndAuthenticate(conn net.Conn) {
+	tlsConn := tls.Server(conn, c.makeTLSConfig())
+	c.conn = tlsConn
+	c.tr = moxio.NewTraceReader(c.log, "C: ", c.conn)
+	c.br = bufio.NewReader(c.tr)
+
+	cidctx := context.WithValue(mox.Context, mlog.CidKey, c.cid)
+	ctx, cancel := context.WithTimeout(cidctx, time.Minute)
+	defer cancel()
+	c.log.Debug("starting tls server handshake")
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		c.xbrokenf("tls handshake: %s (%w)", err, errIO)
+	}
+	cancel()
+
+	cs := tlsConn.ConnectionState()
+	if cs.DidResume && len(cs.PeerCertificates) > 0 {
+		// Verify client after session resumption.
+		err := c.tlsClientAuthVerifyPeerCertParsed(cs.PeerCertificates[0])
+		if err != nil {
+			c.writelinef("* BYE [ALERT] Error verifying client certificate after TLS session resumption: %s", err)
+			c.xbrokenf("tls verify client certificate after resumption: %s (%w)", err, errIO)
+		}
+	}
+
+	attrs := []slog.Attr{
+		slog.Any("version", tlsVersion(cs.Version)),
+		slog.String("ciphersuite", tls.CipherSuiteName(cs.CipherSuite)),
+		slog.String("sni", cs.ServerName),
+		slog.Bool("resumed", cs.DidResume),
+		slog.Int("clientcerts", len(cs.PeerCertificates)),
+	}
+	if c.account != nil {
+		attrs = append(attrs,
+			slog.String("account", c.account.Name),
+			slog.String("username", c.username),
+		)
+	}
+	c.log.Debug("tls handshake completed", attrs...)
+}
+
+type tlsVersion uint16
+
+func (v tlsVersion) String() string {
+	return strings.ReplaceAll(strings.ToLower(tls.VersionName(uint16(v))), " ", "-")
 }
 
 func (c *conn) command() {
@@ -720,9 +1128,9 @@ func (c *conn) command() {
 			metricIMAPCommands.WithLabelValues(c.cmdMetric, result).Observe(float64(time.Since(c.cmdStart)) / float64(time.Second))
 		}()
 
-		logFields := []mlog.Pair{
-			mlog.Field("cmd", c.cmd),
-			mlog.Field("duration", time.Since(c.cmdStart)),
+		logFields := []slog.Attr{
+			slog.String("cmd", c.cmd),
+			slog.Duration("duration", time.Since(c.cmdStart)),
 		}
 		c.cmd = ""
 
@@ -730,11 +1138,24 @@ func (c *conn) command() {
 		if x == nil || x == cleanClose {
 			c.log.Debug("imap command done", logFields...)
 			result = "ok"
+			if x == cleanClose {
+				// If compression was enabled, we flush & close the deflate stream.
+				if c.compress {
+					// Note: Close and flush can Write and may panic with an i/o error.
+					if err := c.flateWriter.Close(); err != nil {
+						c.log.Debugx("close deflate writer", err)
+					} else if err := c.flateBW.Flush(); err != nil {
+						c.log.Debugx("flush deflate buffer", err)
+					}
+				}
+
+				panic(x)
+			}
 			return
 		}
 		err, ok := x.(error)
 		if !ok {
-			c.log.Error("imap command panic", append([]mlog.Pair{mlog.Field("panic", x)}, logFields...)...)
+			c.log.Error("imap command panic", append([]slog.Attr{slog.Any("panic", x)}, logFields...)...)
 			result = "panic"
 			panic(x)
 		}
@@ -756,10 +1177,10 @@ func (c *conn) command() {
 				// stop processing because there is a good chance whatever they sent has multiple
 				// lines.
 				c.writelinef("* BYE please try again speaking imap")
-				panic(errIO)
+				c.xbrokenf("not speaking imap (%w)", errIO)
 			}
 			c.log.Debugx("imap command syntax error", sxerr.err, logFields...)
-			c.log.Info("imap syntax error", mlog.Field("lastline", c.lastLine))
+			c.log.Info("imap syntax error", slog.String("lastline", c.lastLine))
 			fatal := strings.HasSuffix(c.lastLine, "+}")
 			if fatal {
 				err := c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -809,7 +1230,7 @@ func (c *conn) command() {
 	case <-mox.Shutdown.Done():
 		// ../rfc/9051:5375
 		c.writelinef("* BYE shutting down")
-		panic(errIO)
+		c.xbrokenf("shutting down (%w)", errIO)
 	default:
 	}
 
@@ -838,7 +1259,7 @@ func (c *conn) broadcast(changes []store.Change) {
 	if len(changes) == 0 {
 		return
 	}
-	c.log.Debug("broadcast changes", mlog.Field("changes", changes))
+	c.log.Debug("broadcast changes", slog.Any("changes", changes))
 	c.comm.Broadcast(changes)
 }
 
@@ -869,7 +1290,7 @@ func xmailboxPatternMatcher(ref string, patterns []string) matchStringer {
 
 		s := pat
 		if ref != "" {
-			s = filepath.Join(ref, pat)
+			s = path.Join(ref, pat)
 		}
 
 		// Fix casing for all Inbox paths.
@@ -933,7 +1354,7 @@ func (c *conn) xsequence(uid store.UID) msgseq {
 func (c *conn) sequenceRemove(seq msgseq, uid store.UID) {
 	i := seq - 1
 	if c.uids[i] != uid {
-		xserverErrorf(fmt.Sprintf("got uid %d at msgseq %d, expected uid %d", uid, seq, c.uids[i]))
+		xserverErrorf("got uid %d at msgseq %d, expected uid %d", uid, seq, c.uids[i])
 	}
 	copy(c.uids[i:], c.uids[i+1:])
 	c.uids = c.uids[:len(c.uids)-1]
@@ -1110,33 +1531,11 @@ func (c *conn) ok(tag, cmd string) {
 // Name is invalid if it contains leading/trailing/double slashes, or when it isn't
 // unicode-normalized, or when empty or has special characters.
 func xcheckmailboxname(name string, allowInbox bool) string {
-	first := strings.SplitN(name, "/", 2)[0]
-	if strings.EqualFold(first, "inbox") {
-		if len(name) == len("inbox") && !allowInbox {
-			xuserErrorf("special mailbox name Inbox not allowed")
-		}
-		name = "Inbox" + name[len("Inbox"):]
-	}
-
-	if norm.NFC.String(name) != name {
-		xusercodeErrorf("CANNOT", "non-unicode-normalized mailbox names not allowed")
-	}
-
-	if name == "" {
-		xusercodeErrorf("CANNOT", "empty mailbox name")
-	}
-	if strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") || strings.Contains(name, "//") {
-		xusercodeErrorf("CANNOT", "bad slashes in mailbox name")
-	}
-	for _, c := range name {
-		switch c {
-		case '%', '*', '#', '&':
-			xusercodeErrorf("CANNOT", "character %c not allowed in mailbox name", c)
-		}
-		// ../rfc/6855:192
-		if c <= 0x1f || c >= 0x7f && c <= 0x9f || c == 0x2028 || c == 0x2029 {
-			xusercodeErrorf("CANNOT", "control characters not allowed in mailbox name")
-		}
+	name, isinbox, err := store.CheckMailboxName(name, allowInbox)
+	if isinbox {
+		xuserErrorf("special mailboxname Inbox not allowed")
+	} else if err != nil {
+		xusercodeErrorf("CANNOT", "%s", err)
 	}
 	return name
 }
@@ -1179,7 +1578,7 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 	err := c.conn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
 	c.log.Check(err, "setting write deadline")
 
-	c.log.Debug("applying changes", mlog.Field("changes", changes))
+	c.log.Debug("applying changes", slog.Any("changes", changes))
 
 	// Only keep changes for the selected mailbox, and changes that are always relevant.
 	var n []store.Change
@@ -1195,6 +1594,15 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 		case store.ChangeRemoveMailbox, store.ChangeAddMailbox, store.ChangeRenameMailbox, store.ChangeAddSubscription:
 			n = append(n, change)
 			continue
+		case store.ChangeAnnotation:
+			// note: annotations may have a mailbox associated with them, but we pass all
+			// changes on.
+			// Only when the metadata capability was enabled. ../rfc/5464:660
+			if c.enabled[capMetadata] {
+				n = append(n, change)
+				continue
+			}
+		case store.ChangeMailboxCounts, store.ChangeMailboxSpecialUse, store.ChangeMailboxKeywords, store.ChangeThread:
 		default:
 			panic(fmt.Errorf("missing case for %#v", change))
 		}
@@ -1203,6 +1611,9 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 		}
 	}
 	changes = n
+
+	qresync := c.enabled[capQresync]
+	condstore := c.enabled[capCondstore]
 
 	i := 0
 	for i < len(changes) {
@@ -1230,7 +1641,11 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 			c.bwritelinef("* %d EXISTS", len(c.uids))
 			for _, add := range adds {
 				seq := c.xsequence(add.UID)
-				c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", seq, add.UID, flaglist(add.Flags).pack(c))
+				var modseqStr string
+				if condstore {
+					modseqStr = fmt.Sprintf(" MODSEQ (%d)", add.ModSeq.Client())
+				}
+				c.bwritelinef("* %d FETCH (UID %d FLAGS %s%s)", seq, add.UID, flaglist(add.Flags, add.Keywords).pack(c), modseqStr)
 			}
 			continue
 		}
@@ -1240,6 +1655,7 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 
 		switch ch := change.(type) {
 		case store.ChangeRemoveUIDs:
+			var vanishedUIDs numSet
 			for _, uid := range ch.UIDs {
 				var seq msgseq
 				if initial {
@@ -1252,7 +1668,17 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 				}
 				c.sequenceRemove(seq, uid)
 				if !initial {
-					c.bwritelinef("* %d EXPUNGE", seq)
+					if qresync {
+						vanishedUIDs.append(uint32(uid))
+					} else {
+						c.bwritelinef("* %d EXPUNGE", seq)
+					}
+				}
+			}
+			if qresync {
+				// VANISHED without EARLIER. ../rfc/7162:2004
+				for _, s := range vanishedUIDs.Strings(4*1024 - 32) {
+					c.bwritelinef("* VANISHED %s", s)
 				}
 			}
 		case store.ChangeFlags:
@@ -1262,21 +1688,33 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 				continue
 			}
 			if !initial {
-				c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", seq, ch.UID, flaglist(ch.Flags).pack(c))
+				var modseqStr string
+				if condstore {
+					modseqStr = fmt.Sprintf(" MODSEQ (%d)", ch.ModSeq.Client())
+				}
+				c.bwritelinef("* %d FETCH (UID %d FLAGS %s%s)", seq, ch.UID, flaglist(ch.Flags, ch.Keywords).pack(c), modseqStr)
 			}
 		case store.ChangeRemoveMailbox:
 			// Only announce \NonExistent to modern clients, otherwise they may ignore the
 			// unrecognized \NonExistent and interpret this as a newly created mailbox, while
 			// the goal was to remove it...
 			if c.enabled[capIMAP4rev2] {
-				c.bwritelinef(`* LIST (\NonExistent) "/" %s`, astring(ch.Name).pack(c))
+				c.bwritelinef(`* LIST (\NonExistent) "/" %s`, mailboxt(ch.Name).pack(c))
 			}
 		case store.ChangeAddMailbox:
-			c.bwritelinef(`* LIST (%s) "/" %s`, strings.Join(ch.Flags, " "), astring(ch.Name).pack(c))
+			c.bwritelinef(`* LIST (%s) "/" %s`, strings.Join(ch.Flags, " "), mailboxt(ch.Mailbox.Name).pack(c))
 		case store.ChangeRenameMailbox:
-			c.bwritelinef(`* LIST (%s) "/" %s ("OLDNAME" (%s))`, strings.Join(ch.Flags, " "), astring(ch.NewName).pack(c), string0(ch.OldName).pack(c))
+			// OLDNAME only with IMAP4rev2 or NOTIFY ../rfc/9051:2726 ../rfc/5465:628
+			var oldname string
+			if c.enabled[capIMAP4rev2] {
+				oldname = fmt.Sprintf(` ("OLDNAME" (%s))`, mailboxt(ch.OldName).pack(c))
+			}
+			c.bwritelinef(`* LIST (%s) "/" %s%s`, strings.Join(ch.Flags, " "), mailboxt(ch.NewName).pack(c), oldname)
 		case store.ChangeAddSubscription:
-			c.bwritelinef(`* LIST (\Subscribed) "/" %s`, astring(ch.Name).pack(c))
+			c.bwritelinef(`* LIST (%s) "/" %s`, strings.Join(append([]string{`\Subscribed`}, ch.Flags...), " "), mailboxt(ch.Name).pack(c))
+		case store.ChangeAnnotation:
+			// ../rfc/5464:807 ../rfc/5464:788
+			c.bwritelinef(`* METADATA %s %s`, mailboxt(ch.MailboxName).pack(c), astring(ch.Key).pack(c))
 		default:
 			panic(fmt.Sprintf("internal error, missing case for %#v", change))
 		}
@@ -1306,13 +1744,16 @@ func (c *conn) capabilities() string {
 	caps := serverCapabilities
 	// ../rfc/9051:1238
 	// We only allow starting without TLS when explicitly configured, in violation of RFC.
-	if !c.tls && c.tlsConfig != nil {
+	if !c.tls && c.baseTLSConfig != nil {
 		caps += " STARTTLS"
 	}
 	if c.tls || c.noRequireSTARTTLS {
 		caps += " AUTH=PLAIN"
 	} else {
 		caps += " LOGINDISABLED"
+	}
+	if c.tls && len(c.conn.(*tls.Conn).ConnectionState().PeerCertificates) > 0 && !c.viaHTTPS {
+		caps += " AUTH=EXTERNAL"
 	}
 	return caps
 }
@@ -1356,6 +1797,7 @@ func (c *conn) cmdID(tag, cmd string, p *parser) {
 	// Request syntax: ../rfc/2971:241
 	p.xspace()
 	var params map[string]string
+	var values []string
 	if p.take("(") {
 		params = map[string]string{}
 		for !p.take(")") {
@@ -1369,19 +1811,82 @@ func (c *conn) cmdID(tag, cmd string, p *parser) {
 				xsyntaxErrorf("duplicate key %q", k)
 			}
 			params[k] = v
+			values = append(values, fmt.Sprintf("%s=%q", k, v))
 		}
 	} else {
 		p.xnil()
 	}
 	p.xempty()
 
+	c.userAgent = strings.Join(values, " ")
+
+	// The ID command is typically sent soon after authentication. So we've prepared
+	// the LoginAttempt and write it now.
+	if c.loginAttempt != nil {
+		c.loginAttempt.UserAgent = c.userAgent
+		store.LoginAttemptAdd(context.Background(), c.logbg(), *c.loginAttempt)
+		c.loginAttempt = nil
+		c.loginAttemptTime = time.Time{}
+	}
+
 	// We just log the client id.
-	c.log.Info("client id", mlog.Field("params", params))
+	c.log.Info("client id", slog.Any("params", params))
 
 	// Response syntax: ../rfc/2971:243
 	// We send our name and version. ../rfc/2971:193
 	c.bwritelinef(`* ID ("name" "mox" "version" %s)`, string0(moxvar.Version).pack(c))
 	c.ok(tag, cmd)
+}
+
+// Compress enables compression on the connection. Deflate is the only algorithm
+// specified. TLS doesn't do compression nowadays, so we don't have to check for that.
+//
+// Status: Authenticated. The RFC doesn't mention this in prose, but the command is
+// added to ABNF production rule "command-auth".
+func (c *conn) cmdCompress(tag, cmd string, p *parser) {
+	// Command: ../rfc/4978:122
+
+	// Request syntax: ../rfc/4978:310
+	p.xspace()
+	alg := p.xatom()
+	p.xempty()
+
+	// Will do compression only once.
+	if c.compress {
+		// ../rfc/4978:143
+		xusercodeErrorf("COMPRESSIONACTIVE", "compression already active with previous compress command")
+	}
+	// ../rfc/4978:134
+	if !strings.EqualFold(alg, "deflate") {
+		xuserErrorf("compression algorithm not supported")
+	}
+
+	// We must flush now, before we initialize flate.
+	c.log.Debug("compression enabled")
+	c.ok(tag, cmd)
+
+	c.flateBW = bufio.NewWriter(c)
+	fw0, err := flate.NewWriter(c.flateBW, flate.DefaultCompression)
+	xcheckf(err, "deflate") // Cannot happen.
+	fw := moxio.NewFlateWriter(fw0)
+
+	c.compress = true
+	c.flateWriter = fw
+	c.tw = moxio.NewTraceWriter(c.log, "S: ", c.flateWriter)
+	c.bw = bufio.NewWriter(c.tw) // The previous c.bw will not have buffered data.
+
+	rc := xprefixConn(c.conn, c.br) // c.br may contain buffered data.
+	// We use the special partial reader. Some clients write commands and flush the
+	// buffer in "partial flush" mode instead of "sync flush" mode. The "sync flush"
+	// mode emits an explicit zero-length data block that triggers the Go stdlib flate
+	// reader to return data to us. It wouldn't for blocks written in "partial flush"
+	// mode, and it would block us indefinitely while trying to read another flate
+	// block. The partial reader returns data earlier, but still eagerly consumes all
+	// blocks in its buffer.
+	// todo: also _write_ in partial mode since it uses fewer bytes than a sync flush (which needs an additional 4 bytes for the zero-length data block). we need a writer that can flush in partial mode first. writing with sync flush will work with clients that themselves write with partial flush.
+	fr := flate.NewReaderPartial(rc)
+	c.tr = moxio.NewTraceReader(c.log, "C: ", fr)
+	c.br = bufio.NewReader(c.tr)
 }
 
 // STARTTLS enables TLS on the connection, after a plain text start.
@@ -1399,39 +1904,27 @@ func (c *conn) cmdStarttls(tag, cmd string, p *parser) {
 	if c.tls {
 		xsyntaxErrorf("tls already active") // ../rfc/9051:1353
 	}
-
-	conn := c.conn
-	if n := c.br.Buffered(); n > 0 {
-		buf := make([]byte, n)
-		_, err := io.ReadFull(c.br, buf)
-		xcheckf(err, "reading buffered data for tls handshake")
-		conn = &prefixConn{buf, conn}
+	if c.baseTLSConfig == nil {
+		xsyntaxErrorf("starttls not announced")
 	}
-	c.ok(tag, cmd)
 
-	cidctx := context.WithValue(mox.Context, mlog.CidKey, c.cid)
-	ctx, cancel := context.WithTimeout(cidctx, time.Minute)
-	defer cancel()
-	tlsConn := tls.Server(conn, c.tlsConfig)
-	c.log.Debug("starting tls server handshake")
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		panic(fmt.Errorf("starttls handshake: %s (%w)", err, errIO))
-	}
-	cancel()
-	tlsversion, ciphersuite := mox.TLSInfo(tlsConn)
-	c.log.Debug("tls server handshake done", mlog.Field("tls", tlsversion), mlog.Field("ciphersuite", ciphersuite))
+	conn := xprefixConn(c.conn, c.br)
+	// We add the cid to facilitate debugging in case of TLS connection failure.
+	c.ok(tag, cmd+" ("+mox.ReceivedID(c.cid)+")")
 
-	c.conn = tlsConn
-	c.tr = moxio.NewTraceReader(c.log, "C: ", c.conn)
-	c.tw = moxio.NewTraceWriter(c.log, "S: ", c)
-	c.br = bufio.NewReader(c.tr)
-	c.bw = bufio.NewWriter(c.tw)
+	c.xtlsHandshakeAndAuthenticate(conn)
 	c.tls = true
+
+	// We are not sending unsolicited CAPABILITIES for newly available authentication
+	// mechanisms, clients can't depend on us sending it and should ask it themselves.
+	// ../rfc/9051:1382
 }
 
 // Authenticate using SASL. Supports multiple back and forths between client and
 // server to finish authentication, unlike LOGIN which is just a single
 // username/password.
+//
+// We may already have ambient TLS credentials that have not been activated.
 //
 // Status: Not authenticated.
 func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
@@ -1442,8 +1935,17 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 	if c.authFailed > 3 && authFailDelay > 0 {
 		mox.Sleep(mox.Context, time.Duration(c.authFailed-3)*authFailDelay)
 	}
+
+	// If authentication fails due to missing derived secrets, we don't hold it against
+	// the connection. There is no way to indicate server support for an authentication
+	// mechanism, but that a mechanism won't work for an account.
+	var missingDerivedSecrets bool
+
 	c.authFailed++ // Compensated on success.
 	defer func() {
+		if missingDerivedSecrets {
+			c.authFailed--
+		}
 		// On the 3rd failed authentication, start responding slowly. Successful auth will
 		// cause fast responses again.
 		if c.authFailed >= 3 {
@@ -1451,14 +1953,11 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		}
 	}()
 
-	var authVariant string
-	authResult := "error"
+	c.newLoginAttempt(true, "")
 	defer func() {
-		metrics.AuthenticationInc("imap", authVariant, authResult)
-		switch authResult {
-		case "ok":
+		if c.loginAttempt.Result == store.AuthSuccess {
 			mox.LimiterFailedAuth.Reset(c.remoteIP, time.Now())
-		default:
+		} else if !missingDerivedSecrets {
 			mox.LimiterFailedAuth.Add(c.remoteIP, time.Now(), 1)
 		}
 	}()
@@ -1483,7 +1982,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		}
 		// ../rfc/9051:1442 ../rfc/3501:1553
 		if line == "*" {
-			authResult = "aborted"
+			c.loginAttempt.Result = store.AuthAborted
 			xsyntaxErrorf("authenticate aborted by client")
 		}
 		buf, err := base64.StdEncoding.DecodeString(line)
@@ -1496,7 +1995,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 	xreadContinuation := func() []byte {
 		line := c.readline(false)
 		if line == "*" {
-			authResult = "aborted"
+			c.loginAttempt.Result = store.AuthAborted
 			xsyntaxErrorf("authenticate aborted by client")
 		}
 		buf, err := base64.StdEncoding.DecodeString(line)
@@ -1506,9 +2005,21 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		return buf
 	}
 
+	// The various authentication mechanisms set account and username. We may already
+	// have an account and username from TLS client authentication. Afterwards, we
+	// check that the account is the same.
+	var account *store.Account
+	var username string
+	defer func() {
+		if account != nil {
+			err := account.Close()
+			c.xsanity(err, "close account")
+		}
+	}()
+
 	switch strings.ToUpper(authType) {
 	case "PLAIN":
-		authVariant = "plain"
+		c.loginAttempt.AuthMech = "plain"
 
 		if !c.noRequireSTARTTLS && !c.tls {
 			// ../rfc/9051:5194
@@ -1523,27 +2034,28 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		if len(plain) != 3 {
 			xsyntaxErrorf("bad plain auth data, expected 3 nul-separated tokens, got %d tokens", len(plain))
 		}
-		authz := string(plain[0])
-		authc := string(plain[1])
+		authz := norm.NFC.String(string(plain[0]))
+		username = norm.NFC.String(string(plain[1]))
 		password := string(plain[2])
+		c.loginAttempt.LoginAddress = username
 
-		if authz != "" && authz != authc {
+		if authz != "" && authz != username {
 			xusercodeErrorf("AUTHORIZATIONFAILED", "cannot assume role")
 		}
 
-		acc, err := store.OpenEmailAuth(authc, password)
+		var err error
+		account, c.loginAttempt.AccountName, err = store.OpenEmailAuth(c.log, username, password, false)
 		if err != nil {
 			if errors.Is(err, store.ErrUnknownCredentials) {
-				authResult = "badcreds"
+				c.loginAttempt.Result = store.AuthBadCredentials
+				c.log.Info("authentication failed", slog.String("username", username))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 			}
 			xusercodeErrorf("", "error")
 		}
-		c.account = acc
-		c.username = authc
 
 	case "CRAM-MD5":
-		authVariant = strings.ToLower(authType)
+		c.loginAttempt.AuthMech = strings.ToLower(authType)
 
 		// ../rfc/9051:1462
 		p.xempty()
@@ -1557,26 +2069,25 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		if len(t) != 2 || len(t[1]) != 2*md5.Size {
 			xsyntaxErrorf("malformed cram-md5 response")
 		}
-		addr := t[0]
-		c.log.Debug("cram-md5 auth", mlog.Field("address", addr))
-		acc, _, err := store.OpenEmail(addr)
+		username = norm.NFC.String(t[0])
+		c.loginAttempt.LoginAddress = username
+		c.log.Debug("cram-md5 auth", slog.String("address", username))
+		var err error
+		account, c.loginAttempt.AccountName, _, err = store.OpenEmail(c.log, username, false)
 		if err != nil {
 			if errors.Is(err, store.ErrUnknownCredentials) {
+				c.loginAttempt.Result = store.AuthBadCredentials
+				c.log.Info("failed authentication attempt", slog.String("username", username), slog.Any("remote", c.remoteIP))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 			}
 			xserverErrorf("looking up address: %v", err)
 		}
-		defer func() {
-			if acc != nil {
-				err := acc.Close()
-				c.xsanity(err, "close account")
-			}
-		}()
 		var ipadhash, opadhash hash.Hash
-		acc.WithRLock(func() {
-			err := acc.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
+		account.WithRLock(func() {
+			err := account.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 				password, err := bstore.QueryTx[store.Password](tx).Get()
 				if err == bstore.ErrAbsent {
+					c.log.Info("failed authentication attempt", slog.String("username", username), slog.Any("remote", c.remoteIP))
 					xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 				}
 				if err != nil {
@@ -1590,7 +2101,9 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 			xcheckf(err, "tx read")
 		})
 		if ipadhash == nil || opadhash == nil {
-			c.log.Info("cram-md5 auth attempt without derived secrets set, save password again to store secrets", mlog.Field("address", addr))
+			c.log.Info("cram-md5 auth attempt without derived secrets set, save password again to store secrets", slog.String("username", username))
+			c.log.Info("failed authentication attempt", slog.String("username", username), slog.Any("remote", c.remoteIP))
+			missingDerivedSecrets = true
 			xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 		}
 
@@ -1599,64 +2112,79 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		opadhash.Write(ipadhash.Sum(nil))
 		digest := fmt.Sprintf("%x", opadhash.Sum(nil))
 		if digest != t[1] {
+			c.log.Info("failed authentication attempt", slog.String("username", username), slog.Any("remote", c.remoteIP))
 			xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 		}
 
-		c.account = acc
-		acc = nil // Cancel cleanup.
-		c.username = addr
-
-	case "SCRAM-SHA-1", "SCRAM-SHA-256":
+	case "SCRAM-SHA-256-PLUS", "SCRAM-SHA-256", "SCRAM-SHA-1-PLUS", "SCRAM-SHA-1":
 		// todo: improve handling of errors during scram. e.g. invalid parameters. should we abort the imap command, or continue until the end and respond with a scram-level error?
 		// todo: use single implementation between ../imapserver/server.go and ../smtpserver/server.go
 
-		authVariant = strings.ToLower(authType)
-		var h func() hash.Hash
-		if authVariant == "scram-sha-1" {
-			h = sha1.New
-		} else {
-			h = sha256.New
-		}
-
 		// No plaintext credentials, we can log these normally.
 
-		c0 := xreadInitial()
-		ss, err := scram.NewServer(h, c0)
-		if err != nil {
-			xsyntaxErrorf("starting scram: %s", err)
+		c.loginAttempt.AuthMech = strings.ToLower(authType)
+		var h func() hash.Hash
+		switch c.loginAttempt.AuthMech {
+		case "scram-sha-1", "scram-sha-1-plus":
+			h = sha1.New
+		case "scram-sha-256", "scram-sha-256-plus":
+			h = sha256.New
+		default:
+			xserverErrorf("missing case for scram variant")
 		}
-		c.log.Debug("scram auth", mlog.Field("authentication", ss.Authentication))
-		acc, _, err := store.OpenEmail(ss.Authentication)
+
+		var cs *tls.ConnectionState
+		requireChannelBinding := strings.HasSuffix(c.loginAttempt.AuthMech, "-plus")
+		if requireChannelBinding && !c.tls {
+			xuserErrorf("cannot use plus variant with tls channel binding without tls")
+		}
+		if c.tls {
+			xcs := c.conn.(*tls.Conn).ConnectionState()
+			cs = &xcs
+		}
+		c0 := xreadInitial()
+		ss, err := scram.NewServer(h, c0, cs, requireChannelBinding)
+		if err != nil {
+			c.log.Infox("scram protocol error", err, slog.Any("remote", c.remoteIP))
+			xuserErrorf("scram protocol error: %s", err)
+		}
+		username = ss.Authentication
+		c.loginAttempt.LoginAddress = username
+		c.log.Debug("scram auth", slog.String("authentication", username))
+		// We check for login being disabled when finishing.
+		account, c.loginAttempt.AccountName, _, err = store.OpenEmail(c.log, username, false)
 		if err != nil {
 			// todo: we could continue scram with a generated salt, deterministically generated
 			// from the username. that way we don't have to store anything but attackers cannot
 			// learn if an account exists. same for absent scram saltedpassword below.
 			xuserErrorf("scram not possible")
 		}
-		defer func() {
-			if acc != nil {
-				err := acc.Close()
-				c.xsanity(err, "close account")
-			}
-		}()
-		if ss.Authorization != "" && ss.Authorization != ss.Authentication {
+		if ss.Authorization != "" && ss.Authorization != username {
 			xuserErrorf("authentication with authorization for different user not supported")
 		}
 		var xscram store.SCRAM
-		acc.WithRLock(func() {
-			err := acc.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
+		account.WithRLock(func() {
+			err := account.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 				password, err := bstore.QueryTx[store.Password](tx).Get()
-				if authVariant == "scram-sha-1" {
-					xscram = password.SCRAMSHA1
-				} else {
-					xscram = password.SCRAMSHA256
-				}
-				if err == bstore.ErrAbsent || err == nil && (len(xscram.Salt) == 0 || xscram.Iterations == 0 || len(xscram.SaltedPassword) == 0) {
-					c.log.Info("scram auth attempt without derived secrets set, save password again to store secrets", mlog.Field("address", ss.Authentication))
-					xuserErrorf("scram not possible")
+				if err == bstore.ErrAbsent {
+					c.log.Info("failed authentication attempt", slog.String("username", username), slog.Any("remote", c.remoteIP))
+					xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 				}
 				xcheckf(err, "fetching credentials")
-				return err
+				switch c.loginAttempt.AuthMech {
+				case "scram-sha-1", "scram-sha-1-plus":
+					xscram = password.SCRAMSHA1
+				case "scram-sha-256", "scram-sha-256-plus":
+					xscram = password.SCRAMSHA256
+				default:
+					xserverErrorf("missing case for scram credentials")
+				}
+				if len(xscram.Salt) == 0 || xscram.Iterations == 0 || len(xscram.SaltedPassword) == 0 {
+					missingDerivedSecrets = true
+					c.log.Info("scram auth attempt without derived secrets set, save password again to store secrets", slog.String("username", username))
+					xuserErrorf("scram not possible")
+				}
+				return nil
 			})
 			xcheckf(err, "read tx")
 		})
@@ -1671,8 +2199,17 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		if err != nil {
 			c.readline(false) // Should be "*" for cancellation.
 			if errors.Is(err, scram.ErrInvalidProof) {
-				authResult = "badcreds"
+				c.loginAttempt.Result = store.AuthBadCredentials
+				c.log.Info("failed authentication attempt", slog.String("username", username), slog.Any("remote", c.remoteIP))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
+			} else if errors.Is(err, scram.ErrChannelBindingsDontMatch) {
+				c.loginAttempt.Result = store.AuthBadChannelBinding
+				c.log.Warn("bad channel binding during authentication, potential mitm", slog.String("username", username), slog.Any("remote", c.remoteIP))
+				xusercodeErrorf("AUTHENTICATIONFAILED", "channel bindings do not match, potential mitm")
+			} else if errors.Is(err, scram.ErrInvalidEncoding) {
+				c.loginAttempt.Result = store.AuthBadProtocol
+				c.log.Infox("bad scram protocol message", err, slog.String("username", username), slog.Any("remote", c.remoteIP))
+				xuserErrorf("bad scram protocol message: %s", err)
 			}
 			xuserErrorf("server final: %w", err)
 		}
@@ -1681,18 +2218,79 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		// The message should be empty. todo: should we require it is empty?
 		xreadContinuation()
 
-		c.account = acc
-		acc = nil // Cancel cleanup.
-		c.username = ss.Authentication
+	case "EXTERNAL":
+		c.loginAttempt.AuthMech = "external"
+
+		// ../rfc/4422:1618
+		buf := xreadInitial()
+		username = norm.NFC.String(string(buf))
+		c.loginAttempt.LoginAddress = username
+
+		if !c.tls {
+			xusercodeErrorf("AUTHENTICATIONFAILED", "tls required for tls client certificate authentication")
+		}
+		if c.account == nil {
+			xusercodeErrorf("AUTHENTICATIONFAILED", "missing client certificate, required for tls client certificate authentication")
+		}
+
+		if username == "" {
+			username = c.username
+			c.loginAttempt.LoginAddress = username
+		}
+		var err error
+		account, c.loginAttempt.AccountName, _, err = store.OpenEmail(c.log, username, false)
+		xcheckf(err, "looking up username from tls client authentication")
 
 	default:
+		c.loginAttempt.AuthMech = "(unrecognized)"
 		xuserErrorf("method not supported")
 	}
 
+	if accConf, ok := account.Conf(); !ok {
+		xserverErrorf("cannot get account config")
+	} else if accConf.LoginDisabled != "" {
+		c.loginAttempt.Result = store.AuthLoginDisabled
+		c.log.Info("account login disabled", slog.String("username", username))
+		// No AUTHENTICATIONFAILED code, clients could prompt users for different password.
+		xuserErrorf("%w: %s", store.ErrLoginDisabled, accConf.LoginDisabled)
+	}
+
+	// We may already have TLS credentials. They won't have been enabled, or we could
+	// get here due to the state machine that doesn't allow authentication while being
+	// authenticated. But allow another SASL authentication, but it has to be for the
+	// same account. It can be for a different username (email address) of the account.
+	if c.account != nil {
+		if account != c.account {
+			c.log.Debug("sasl authentication for different account than tls client authentication, aborting connection",
+				slog.String("saslmechanism", c.loginAttempt.AuthMech),
+				slog.String("saslaccount", account.Name),
+				slog.String("tlsaccount", c.account.Name),
+				slog.String("saslusername", username),
+				slog.String("tlsusername", c.username),
+			)
+			xusercodeErrorf("AUTHENTICATIONFAILED", "authentication failed, tls client certificate public key belongs to another account")
+		} else if username != c.username {
+			c.log.Debug("sasl authentication for different username than tls client certificate authentication, switching to sasl username",
+				slog.String("saslmechanism", c.loginAttempt.AuthMech),
+				slog.String("saslusername", username),
+				slog.String("tlsusername", c.username),
+				slog.String("account", c.account.Name),
+			)
+		}
+	} else {
+		c.account = account
+		account = nil // Prevent cleanup.
+	}
+	c.username = username
+	if c.comm == nil {
+		c.comm = store.RegisterComm(c.account)
+	}
+
 	c.setSlow(false)
-	authResult = "ok"
+	c.loginAttempt.AccountName = c.account.Name
+	c.loginAttempt.LoginAddress = c.username
+	c.loginAttempt.Result = store.AuthSuccess
 	c.authFailed = 0
-	c.comm = store.RegisterComm(c.account)
 	c.state = stateAuthenticated
 	c.writeresultf("%s OK [CAPABILITY %s] authenticate done", tag, c.capabilities())
 }
@@ -1703,16 +2301,21 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 func (c *conn) cmdLogin(tag, cmd string, p *parser) {
 	// Command: ../rfc/9051:1597 ../rfc/3501:1663
 
-	authResult := "error"
+	c.newLoginAttempt(true, "login")
 	defer func() {
-		metrics.AuthenticationInc("imap", "login", authResult)
+		if c.loginAttempt.Result == store.AuthSuccess {
+			mox.LimiterFailedAuth.Reset(c.remoteIP, time.Now())
+		} else {
+			mox.LimiterFailedAuth.Add(c.remoteIP, time.Now(), 1)
+		}
 	}()
 
 	// todo: get this line logged with traceauth. the plaintext password is included on the command line, which we've already read (before dispatching to this function).
 
 	// Request syntax: ../rfc/9051:6667 ../rfc/3501:4804
 	p.xspace()
-	userid := p.xastring()
+	username := norm.NFC.String(p.xastring())
+	c.loginAttempt.LoginAddress = username
 	p.xspace()
 	password := p.xastring()
 	p.xempty()
@@ -1735,22 +2338,68 @@ func (c *conn) cmdLogin(tag, cmd string, p *parser) {
 		}
 	}()
 
-	acc, err := store.OpenEmailAuth(userid, password)
+	account, accName, err := store.OpenEmailAuth(c.log, username, password, true)
+	c.loginAttempt.AccountName = accName
 	if err != nil {
-		authResult = "badcreds"
 		var code string
 		if errors.Is(err, store.ErrUnknownCredentials) {
+			c.loginAttempt.Result = store.AuthBadCredentials
 			code = "AUTHENTICATIONFAILED"
+			c.log.Info("failed authentication attempt", slog.String("username", username), slog.Any("remote", c.remoteIP))
+		} else if errors.Is(err, store.ErrLoginDisabled) {
+			c.loginAttempt.Result = store.AuthLoginDisabled
+			c.log.Info("account login disabled", slog.String("username", username))
+			// There is no specific code for "account disabled" in IMAP. AUTHORIZATIONFAILED is
+			// not a good idea, it will prompt users for a password. ALERT seems reasonable,
+			// but may cause email clients to suppress the message since we are not yet
+			// authenticated. So we don't send anything. ../rfc/9051:4940
+			xuserErrorf("%s", err)
 		}
 		xusercodeErrorf(code, "login failed")
 	}
-	c.account = acc
-	c.username = userid
+	defer func() {
+		if account != nil {
+			err := account.Close()
+			c.xsanity(err, "close account")
+		}
+	}()
+
+	// We may already have TLS credentials. They won't have been enabled, or we could
+	// get here due to the state machine that doesn't allow authentication while being
+	// authenticated. But allow another SASL authentication, but it has to be for the
+	// same account. It can be for a different username (email address) of the account.
+	if c.account != nil {
+		if account != c.account {
+			c.log.Debug("sasl authentication for different account than tls client authentication, aborting connection",
+				slog.String("saslmechanism", "login"),
+				slog.String("saslaccount", account.Name),
+				slog.String("tlsaccount", c.account.Name),
+				slog.String("saslusername", username),
+				slog.String("tlsusername", c.username),
+			)
+			xusercodeErrorf("AUTHENTICATIONFAILED", "authentication failed, tls client certificate public key belongs to another account")
+		} else if username != c.username {
+			c.log.Debug("sasl authentication for different username than tls client certificate authentication, switching to sasl username",
+				slog.String("saslmechanism", "login"),
+				slog.String("saslusername", username),
+				slog.String("tlsusername", c.username),
+				slog.String("account", c.account.Name),
+			)
+		}
+	} else {
+		c.account = account
+		account = nil // Prevent cleanup.
+	}
+	c.username = username
+	if c.comm == nil {
+		c.comm = store.RegisterComm(c.account)
+	}
+	c.loginAttempt.LoginAddress = c.username
+	c.loginAttempt.AccountName = c.account.Name
+	c.loginAttempt.Result = store.AuthSuccess
 	c.authFailed = 0
 	c.setSlow(false)
-	c.comm = store.RegisterComm(acc)
 	c.state = stateAuthenticated
-	authResult = "ok"
 	c.writeresultf("%s OK [CAPABILITY %s] login done", tag, c.capabilities())
 }
 
@@ -1775,18 +2424,58 @@ func (c *conn) cmdEnable(tag, cmd string, p *parser) {
 	// Clients should only send capabilities that need enabling.
 	// We should only echo that we recognize as needing enabling.
 	var enabled string
+	var qresync bool
 	for _, s := range caps {
 		cap := capability(strings.ToUpper(s))
 		switch cap {
-		case capIMAP4rev2, capUTF8Accept:
+		case capIMAP4rev2,
+			capUTF8Accept,
+			capCondstore: // ../rfc/7162:384
+			c.enabled[cap] = true
+			enabled += " " + s
+		case capQresync:
+			c.enabled[cap] = true
+			enabled += " " + s
+			qresync = true
+		case capMetadata:
 			c.enabled[cap] = true
 			enabled += " " + s
 		}
+	}
+	// QRESYNC enabled CONDSTORE too ../rfc/7162:1391
+	if qresync && !c.enabled[capCondstore] {
+		c.xensureCondstore(nil)
+		enabled += " CONDSTORE"
 	}
 
 	// Response syntax: ../rfc/9051:6520 ../rfc/5161:211
 	c.bwritelinef("* ENABLED%s", enabled)
 	c.ok(tag, cmd)
+}
+
+// The CONDSTORE extension can be enabled in many different ways. ../rfc/7162:368
+// If a mailbox is selected, an untagged OK with HIGHESTMODSEQ is written to the
+// client. If tx is non-nil, it is used to read the HIGHESTMODSEQ from the
+// database. Otherwise a new read-only transaction is created.
+func (c *conn) xensureCondstore(tx *bstore.Tx) {
+	if !c.enabled[capCondstore] {
+		c.enabled[capCondstore] = true
+		// todo spec: can we send an untagged enabled response?
+		// ../rfc/7162:603
+		if c.mailboxID <= 0 {
+			return
+		}
+
+		var mb store.Mailbox
+		if tx == nil {
+			c.xdbread(func(tx *bstore.Tx) {
+				mb = c.xmailboxID(tx, c.mailboxID)
+			})
+		} else {
+			mb = c.xmailboxID(tx, c.mailboxID)
+		}
+		c.bwritelinef("* OK [HIGHESTMODSEQ %d] after condstore-enabling command", mb.ModSeq.Client())
+	}
 }
 
 // State: Authenticated and selected.
@@ -1804,27 +2493,82 @@ func (c *conn) cmdExamine(tag, cmd string, p *parser) {
 //
 // State: Authenticated and selected.
 func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
-	// Select command: ../rfc/9051:1754 ../rfc/3501:1743
+	// Select command: ../rfc/9051:1754 ../rfc/3501:1743 ../rfc/7162:1146 ../rfc/7162:1432
 	// Examine command: ../rfc/9051:1868 ../rfc/3501:1855
-	// Select examples: ../rfc/9051:1831 ../rfc/3501:1826
+	// Select examples: ../rfc/9051:1831 ../rfc/3501:1826 ../rfc/7162:1159 ../rfc/7162:1479
 
-	// Select request syntax: ../rfc/9051:7005 ../rfc/3501:4996
+	// Select request syntax: ../rfc/9051:7005 ../rfc/3501:4996 ../rfc/4466:652 ../rfc/7162:2559 ../rfc/7162:2598
 	// Examine request syntax: ../rfc/9051:6551 ../rfc/3501:4746
 	p.xspace()
 	name := p.xmailbox()
+
+	var qruidvalidity uint32
+	var qrmodseq int64                                    // QRESYNC required parameters.
+	var qrknownUIDs, qrknownSeqSet, qrknownUIDSet *numSet // QRESYNC optional parameters.
+	if p.space() {
+		seen := map[string]bool{}
+		p.xtake("(")
+		for len(seen) == 0 || !p.take(")") {
+			w := p.xtakelist("CONDSTORE", "QRESYNC")
+			if seen[w] {
+				xsyntaxErrorf("duplicate select parameter %s", w)
+			}
+			seen[w] = true
+
+			switch w {
+			case "CONDSTORE":
+				// ../rfc/7162:363
+				c.xensureCondstore(nil) // ../rfc/7162:373
+			case "QRESYNC":
+				// ../rfc/7162:2598
+				// Note: unlike with CONDSTORE, there are no QRESYNC-related commands/parameters
+				// that enable capabilities.
+				if !c.enabled[capQresync] {
+					// ../rfc/7162:1446
+					xsyntaxErrorf("QRESYNC must first be enabled")
+				}
+				p.xspace()
+				p.xtake("(")
+				qruidvalidity = p.xnznumber() // ../rfc/7162:2606
+				p.xspace()
+				qrmodseq = p.xnznumber64()
+				if p.take(" ") {
+					seqMatchData := p.take("(")
+					if !seqMatchData {
+						ss := p.xnumSet0(false, false) // ../rfc/7162:2608
+						qrknownUIDs = &ss
+						seqMatchData = p.take(" (")
+					}
+					if seqMatchData {
+						ss0 := p.xnumSet0(false, false)
+						qrknownSeqSet = &ss0
+						p.xspace()
+						ss1 := p.xnumSet0(false, false)
+						qrknownUIDSet = &ss1
+						p.xtake(")")
+					}
+				}
+				p.xtake(")")
+			default:
+				panic("missing case for select param " + w)
+			}
+		}
+	}
 	p.xempty()
 
 	// Deselect before attempting the new select. This means we will deselect when an
 	// error occurs during select.
 	// ../rfc/9051:1809
 	if c.state == stateSelected {
-		// ../rfc/9051:1812
+		// ../rfc/9051:1812 ../rfc/7162:2111
 		c.bwritelinef("* OK [CLOSED] x")
 		c.unselect()
 	}
 
 	name = xcheckmailboxname(name, true)
 
+	var highestModSeq store.ModSeq
+	var highDeletedModSeq store.ModSeq
 	var firstUnseen msgseq = 0
 	var mb store.Mailbox
 	c.account.WithRLock(func() {
@@ -1833,6 +2577,7 @@ func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
 
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: mb.ID})
+			q.FilterEqual("Expunged", false)
 			q.SortAsc("UID")
 			c.uids = []store.UID{}
 			var seq msgseq = 1
@@ -1848,12 +2593,27 @@ func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
 				checkUIDs(c.uids)
 			}
 			xcheckf(err, "fetching uids")
+
+			// Condstore extension, find the highest modseq.
+			if c.enabled[capCondstore] {
+				highestModSeq = mb.ModSeq
+			}
+			// For QRESYNC, we need to know the highest modset of deleted expunged records to
+			// maintain synchronization.
+			if c.enabled[capQresync] {
+				highDeletedModSeq, err = c.account.HighestDeletedModSeq(tx)
+				xcheckf(err, "getting highest deleted modseq")
+			}
 		})
 	})
 	c.applyChanges(c.comm.Get(), true)
 
-	c.bwritelinef(`* FLAGS (\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent)`)
-	c.bwritelinef(`* OK [PERMANENTFLAGS (\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent)] x`)
+	var flags string
+	if len(mb.Keywords) > 0 {
+		flags = " " + strings.Join(mb.Keywords, " ")
+	}
+	c.bwritelinef(`* FLAGS (\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent%s)`, flags)
+	c.bwritelinef(`* OK [PERMANENTFLAGS (\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent \*)] x`)
 	if !c.enabled[capIMAP4rev2] {
 		c.bwritelinef(`* 0 RECENT`)
 	}
@@ -1864,7 +2624,152 @@ func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
 	}
 	c.bwritelinef(`* OK [UIDVALIDITY %d] x`, mb.UIDValidity)
 	c.bwritelinef(`* OK [UIDNEXT %d] x`, mb.UIDNext)
-	c.bwritelinef(`* LIST () "/" %s`, astring(mb.Name).pack(c))
+	c.bwritelinef(`* LIST () "/" %s`, mailboxt(mb.Name).pack(c))
+	if c.enabled[capCondstore] {
+		// ../rfc/7162:417
+		// ../rfc/7162-eid5055 ../rfc/7162:484 ../rfc/7162:1167
+		c.bwritelinef(`* OK [HIGHESTMODSEQ %d] x`, highestModSeq.Client())
+	}
+
+	// If QRESYNC uidvalidity matches, we send any changes. ../rfc/7162:1509
+	if qruidvalidity == mb.UIDValidity {
+		// We send the vanished UIDs at the end, so we can easily combine the modseq
+		// changes and vanished UIDs that result from that, with the vanished UIDs from the
+		// case where we don't store enough history.
+		vanishedUIDs := map[store.UID]struct{}{}
+
+		var preVanished store.UID
+		var oldClientUID store.UID
+		// If samples of known msgseq and uid pairs are given (they must be in order), we
+		// use them to determine the earliest UID for which we send VANISHED responses.
+		// ../rfc/7162:1579
+		if qrknownSeqSet != nil {
+			if !qrknownSeqSet.isBasicIncreasing() {
+				xuserErrorf("QRESYNC known message sequence set must be numeric and strictly increasing")
+			}
+			if !qrknownUIDSet.isBasicIncreasing() {
+				xuserErrorf("QRESYNC known uid set must be numeric and strictly increasing")
+			}
+			seqiter := qrknownSeqSet.newIter()
+			uiditer := qrknownUIDSet.newIter()
+			for {
+				msgseq, ok0 := seqiter.Next()
+				uid, ok1 := uiditer.Next()
+				if !ok0 && !ok1 {
+					break
+				} else if !ok0 || !ok1 {
+					xsyntaxErrorf("invalid combination of known sequence set and uid set, must be of equal length")
+				}
+				i := int(msgseq - 1)
+				if i < 0 || i >= len(c.uids) || c.uids[i] != store.UID(uid) {
+					if uidSearch(c.uids, store.UID(uid)) <= 0 {
+						// We will check this old client UID for consistency below.
+						oldClientUID = store.UID(uid)
+					}
+					break
+				}
+				preVanished = store.UID(uid + 1)
+			}
+		}
+
+		// We gather vanished UIDs and report them at the end. This seems OK because we
+		// already sent HIGHESTMODSEQ, and a client should know not to commit that value
+		// until after it has seen the tagged OK of this command. The RFC has a remark
+		// about ordering of some untagged responses, it's not immediately clear what it
+		// means, but given the examples appears to allude to servers that decide to not
+		// send expunge/vanished before the tagged OK.
+		// ../rfc/7162:1340
+
+		// We are reading without account lock. Similar to when we process FETCH/SEARCH
+		// requests. We don't have to reverify existence of the mailbox, so we don't
+		// rlock, even briefly.
+		c.xdbread(func(tx *bstore.Tx) {
+			if oldClientUID > 0 {
+				// The client sent a UID that is now removed. This is typically fine. But we check
+				// that it is consistent with the modseq the client sent. If the UID already didn't
+				// exist at that modseq, the client may be missing some information.
+				q := bstore.QueryTx[store.Message](tx)
+				q.FilterNonzero(store.Message{MailboxID: mb.ID, UID: oldClientUID})
+				m, err := q.Get()
+				if err == nil {
+					// If client claims to be up to date up to and including qrmodseq, and the message
+					// was deleted at or before that time, we send changes from just before that
+					// modseq, and we send vanished for all UIDs.
+					if m.Expunged && qrmodseq >= m.ModSeq.Client() {
+						qrmodseq = m.ModSeq.Client() - 1
+						preVanished = 0
+						qrknownUIDs = nil
+						c.bwritelinef("* OK [ALERT] Synchronization inconsistency in client detected. Client tried to sync with a UID that was removed at or after the MODSEQ it sent in the request. Sending all historic message removals for selected mailbox. Full synchronization recommended.")
+					}
+				} else if err != bstore.ErrAbsent {
+					xcheckf(err, "checking old client uid")
+				}
+			}
+
+			q := bstore.QueryTx[store.Message](tx)
+			q.FilterNonzero(store.Message{MailboxID: mb.ID})
+			// Note: we don't filter by Expunged.
+			q.FilterGreater("ModSeq", store.ModSeqFromClient(qrmodseq))
+			q.FilterLessEqual("ModSeq", highestModSeq)
+			q.SortAsc("ModSeq")
+			err := q.ForEach(func(m store.Message) error {
+				if m.Expunged && m.UID < preVanished {
+					return nil
+				}
+				// If known UIDs was specified, we only report about those UIDs. ../rfc/7162:1523
+				if qrknownUIDs != nil && !qrknownUIDs.contains(uint32(m.UID)) {
+					return nil
+				}
+				if m.Expunged {
+					vanishedUIDs[m.UID] = struct{}{}
+					return nil
+				}
+				msgseq := c.sequence(m.UID)
+				if msgseq > 0 {
+					c.bwritelinef("* %d FETCH (UID %d FLAGS %s MODSEQ (%d))", msgseq, m.UID, flaglist(m.Flags, m.Keywords).pack(c), m.ModSeq.Client())
+				}
+				return nil
+			})
+			xcheckf(err, "listing changed messages")
+		})
+
+		// Add UIDs from client's known UID set to vanished list if we don't have enough history.
+		if qrmodseq < highDeletedModSeq.Client() {
+			// If no known uid set was in the request, we substitute 1:max or the empty set.
+			// ../rfc/7162:1524
+			if qrknownUIDs == nil {
+				if len(c.uids) > 0 {
+					qrknownUIDs = &numSet{ranges: []numRange{{first: setNumber{number: 1}, last: &setNumber{number: uint32(c.uids[len(c.uids)-1])}}}}
+				} else {
+					qrknownUIDs = &numSet{}
+				}
+			}
+
+			iter := qrknownUIDs.newIter()
+			for {
+				v, ok := iter.Next()
+				if !ok {
+					break
+				}
+				if c.sequence(store.UID(v)) <= 0 {
+					vanishedUIDs[store.UID(v)] = struct{}{}
+				}
+			}
+		}
+
+		// Now that we have all vanished UIDs, send them over compactly.
+		if len(vanishedUIDs) > 0 {
+			l := maps.Keys(vanishedUIDs)
+			sort.Slice(l, func(i, j int) bool {
+				return l[i] < l[j]
+			})
+			// ../rfc/7162:1985
+			for _, s := range compactUIDSet(l).Strings(4*1024 - 32) {
+				c.bwritelinef("* VANISHED (EARLIER) %s", s)
+			}
+		}
+	}
+
 	if isselect {
 		c.bwriteresultf("%s OK [READ-WRITE] x", tag)
 		c.readonly = false
@@ -1888,55 +2793,80 @@ func (c *conn) cmdCreate(tag, cmd string, p *parser) {
 	// Request syntax: ../rfc/9051:6484 ../rfc/6154:468 ../rfc/4466:500 ../rfc/3501:4687
 	p.xspace()
 	name := p.xmailbox()
-	// todo: support CREATE-SPECIAL-USE ../rfc/6154:296
+	// Optional parameters. ../rfc/4466:501 ../rfc/4466:511
+	var useAttrs []string // Special-use attributes without leading \.
+	if p.space() {
+		p.xtake("(")
+		// We only support "USE", and there don't appear to be more types of parameters.
+		for {
+			p.xtake("USE (")
+			for {
+				p.xtake(`\`)
+				useAttrs = append(useAttrs, p.xatom())
+				if !p.space() {
+					break
+				}
+			}
+			p.xtake(")")
+			if !p.space() {
+				break
+			}
+		}
+		p.xtake(")")
+	}
 	p.xempty()
 
 	origName := name
 	name = strings.TrimRight(name, "/") // ../rfc/9051:1930
 	name = xcheckmailboxname(name, false)
 
+	var specialUse store.SpecialUse
+	specialUseBools := map[string]*bool{
+		"archive": &specialUse.Archive,
+		"drafts":  &specialUse.Draft,
+		"junk":    &specialUse.Junk,
+		"sent":    &specialUse.Sent,
+		"trash":   &specialUse.Trash,
+	}
+	for _, s := range useAttrs {
+		p, ok := specialUseBools[strings.ToLower(s)]
+		if !ok {
+			// ../rfc/6154:287
+			xusercodeErrorf("USEATTR", `cannot create mailbox with special-use attribute \%s`, s)
+		}
+		*p = true
+	}
+
 	var changes []store.Change
 	var created []string // Created mailbox names.
 
 	c.account.WithWLock(func() {
 		c.xdbwrite(func(tx *bstore.Tx) {
-			elems := strings.Split(name, "/")
-			var p string
-			for i, elem := range elems {
-				if i > 0 {
-					p += "/"
-				}
-				p += elem
-				exists, err := c.account.MailboxExists(tx, p)
-				xcheckf(err, "checking if mailbox exists")
-				if exists {
-					if i == len(elems)-1 {
-						// ../rfc/9051:1914
-						xuserErrorf("mailbox already exists")
-					}
-					continue
-				}
-				_, nchanges, err := c.account.MailboxEnsure(tx, p, true)
-				xcheckf(err, "ensuring mailbox exists")
-				changes = append(changes, nchanges...)
-				created = append(created, p)
+			var exists bool
+			var err error
+			changes, created, exists, err = c.account.MailboxCreate(tx, name, specialUse)
+			if exists {
+				// ../rfc/9051:1914
+				xuserErrorf("mailbox already exists")
 			}
+			xcheckf(err, "creating mailbox")
 		})
 
 		c.broadcast(changes)
 	})
 
 	for _, n := range created {
-		var more string
-		if n == name && name != origName && !(name == "Inbox" || strings.HasPrefix(name, "Inbox/")) {
-			more = fmt.Sprintf(` ("OLDNAME" (%s))`, string0(origName).pack(c))
+		var oldname string
+		// OLDNAME only with IMAP4rev2 or NOTIFY ../rfc/9051:2726 ../rfc/5465:628
+		if c.enabled[capIMAP4rev2] && n == name && name != origName && !(name == "Inbox" || strings.HasPrefix(name, "Inbox/")) {
+			oldname = fmt.Sprintf(` ("OLDNAME" (%s))`, mailboxt(origName).pack(c))
 		}
-		c.bwritelinef(`* LIST (\Subscribed) "/" %s%s`, astring(n).pack(c), more)
+		c.bwritelinef(`* LIST (\Subscribed) "/" %s%s`, mailboxt(n).pack(c), oldname)
 	}
 	c.ok(tag, cmd)
 }
 
-// Delete removes a mailbox and all its messages.
+// Delete removes a mailbox and all its messages and annotations.
 // Inbox cannot be removed.
 //
 // State: Authenticated and selected.
@@ -1952,74 +2882,39 @@ func (c *conn) cmdDelete(tag, cmd string, p *parser) {
 	name = xcheckmailboxname(name, false)
 
 	// Messages to remove after having broadcasted the removal of messages.
-	var remove []store.Message
+	var removeMessageIDs []int64
 
 	c.account.WithWLock(func() {
 		var mb store.Mailbox
+		var changes []store.Change
 
 		c.xdbwrite(func(tx *bstore.Tx) {
 			mb = c.xmailbox(tx, name, "NONEXISTENT")
 
-			// Look for existence of child mailboxes. There is a lot of text in the RFCs about
-			// NoInferior and NoSelect. We just require only leaf mailboxes are deleted.
-			qmb := bstore.QueryTx[store.Mailbox](tx)
-			mbprefix := name + "/"
-			qmb.FilterFn(func(mb store.Mailbox) bool {
-				return strings.HasPrefix(mb.Name, mbprefix)
-			})
-			childExists, err := qmb.Exists()
-			xcheckf(err, "checking child existence")
-			if childExists {
+			var hasChildren bool
+			var err error
+			changes, removeMessageIDs, hasChildren, err = c.account.MailboxDelete(context.TODO(), c.log, tx, mb)
+			if hasChildren {
 				xusercodeErrorf("HASCHILDREN", "mailbox has a child, only leaf mailboxes can be deleted")
 			}
-
-			qm := bstore.QueryTx[store.Message](tx)
-			qm.FilterNonzero(store.Message{MailboxID: mb.ID})
-			remove, err = qm.List()
-			xcheckf(err, "listing messages to remove")
-
-			if len(remove) > 0 {
-				removeIDs := make([]any, len(remove))
-				for i, m := range remove {
-					removeIDs[i] = m.ID
-				}
-				qmr := bstore.QueryTx[store.Recipient](tx)
-				qmr.FilterEqual("MessageID", removeIDs...)
-				_, err = qmr.Delete()
-				xcheckf(err, "removing message recipients for messages")
-
-				qm = bstore.QueryTx[store.Message](tx)
-				qm.FilterNonzero(store.Message{MailboxID: mb.ID})
-				_, err = qm.Delete()
-				xcheckf(err, "removing messages")
-
-				// Mark messages as not needing training. Then retrain them, so that are untrained if they were.
-				for i := range remove {
-					remove[i].Junk = false
-					remove[i].Notjunk = false
-				}
-				err = c.account.RetrainMessages(context.TODO(), c.log, tx, remove, true)
-				xcheckf(err, "untraining deleted messages")
-			}
-
-			err = tx.Delete(&store.Mailbox{ID: mb.ID})
-			xcheckf(err, "removing mailbox")
+			xcheckf(err, "deleting mailbox")
 		})
 
-		c.broadcast([]store.Change{store.ChangeRemoveMailbox{Name: name}})
+		c.broadcast(changes)
 	})
 
-	for _, m := range remove {
-		p := c.account.MessagePath(m.ID)
+	for _, mID := range removeMessageIDs {
+		p := c.account.MessagePath(mID)
 		err := os.Remove(p)
-		c.log.Check(err, "removing message file for mailbox delete", mlog.Field("path", p))
+		c.xsanity(err, "removing message file %q for mailbox delete", p)
 	}
 
 	c.ok(tag, cmd)
 }
 
 // Rename changes the name of a mailbox.
-// Renaming INBOX is special, it moves the inbox messages to a new mailbox, leaving inbox empty.
+// Renaming INBOX is special, it moves the inbox messages to a new mailbox, leaving
+// inbox empty, but copying metadata annotations.
 // Renaming a mailbox with submailboxes also renames all submailboxes.
 // Subscriptions stay with the old name, though newly created missing parent
 // mailboxes for the destination name are automatically subscribed.
@@ -2043,12 +2938,13 @@ func (c *conn) cmdRename(tag, cmd string, p *parser) {
 		var changes []store.Change
 
 		c.xdbwrite(func(tx *bstore.Tx) {
-			uidval, err := c.account.NextUIDValidity(tx)
-			xcheckf(err, "next uid validity")
+			srcMB := c.xmailbox(tx, src, "NONEXISTENT")
 
-			// Inbox is very special case. Unlike other mailboxes, its children are not moved. And
-			// unlike a regular move, its messages are moved to a newly created mailbox.
-			// We do indeed create a new destination mailbox and actually move the messages.
+			var modseq store.ModSeq
+
+			// Inbox is very special. Unlike other mailboxes, its children are not moved. And
+			// unlike a regular move, its messages are moved to a newly created mailbox. We do
+			// indeed create a new destination mailbox and actually move the messages.
 			// ../rfc/9051:2101
 			if src == "Inbox" {
 				exists, err := c.account.MailboxExists(tx, dst)
@@ -2056,134 +2952,112 @@ func (c *conn) cmdRename(tag, cmd string, p *parser) {
 				if exists {
 					xusercodeErrorf("ALREADYEXISTS", "destination mailbox %q already exists", dst)
 				}
-				srcMB, err := c.account.MailboxFind(tx, src)
-				xcheckf(err, "finding source mailbox")
-				if srcMB == nil {
-					xserverErrorf("inbox not found")
-				}
 				if dst == src {
 					xuserErrorf("cannot move inbox to itself")
 				}
+
+				uidval, err := c.account.NextUIDValidity(tx)
+				xcheckf(err, "next uid validity")
+
+				modseq, err = c.account.NextModSeq(tx)
+				xcheckf(err, "assigning next modseq")
 
 				dstMB := store.Mailbox{
 					Name:        dst,
 					UIDValidity: uidval,
 					UIDNext:     1,
+					Keywords:    srcMB.Keywords,
+					ModSeq:      modseq,
+					CreateSeq:   modseq,
+					HaveCounts:  true,
 				}
 				err = tx.Insert(&dstMB)
 				xcheckf(err, "create new destination mailbox")
 
-				var messages []store.Message
+				changes = make([]store.Change, 2) // Placeholders filled in below.
+
+				// Move existing messages, with their ID's and on-disk files intact, to the new
+				// mailbox. We keep the expunged messages, the destination mailbox doesn't care
+				// about them.
+				var oldUIDs []store.UID
 				q := bstore.QueryTx[store.Message](tx)
 				q.FilterNonzero(store.Message{MailboxID: srcMB.ID})
-				q.Gather(&messages)
-				_, err = q.UpdateNonzero(store.Message{MailboxID: dstMB.ID})
+				q.FilterEqual("Expunged", false)
+				q.SortAsc("UID")
+				err = q.ForEach(func(m store.Message) error {
+					om := m
+					om.ID = 0
+					om.ModSeq = modseq
+					om.PrepareExpunge()
+					oldUIDs = append(oldUIDs, om.UID)
+
+					mc := m.MailboxCounts()
+					srcMB.Sub(mc)
+					dstMB.Add(mc)
+
+					m.MailboxID = dstMB.ID
+					m.UID = dstMB.UIDNext
+					dstMB.UIDNext++
+					m.CreateSeq = modseq
+					m.ModSeq = modseq
+					if err := tx.Update(&m); err != nil {
+						return fmt.Errorf("updating message to move to new mailbox: %w", err)
+					}
+
+					changes = append(changes, m.ChangeAddUID())
+
+					if err := tx.Insert(&om); err != nil {
+						return fmt.Errorf("adding empty expunge message record to inbox: %w", err)
+					}
+					return nil
+				})
 				xcheckf(err, "moving messages from inbox to destination mailbox")
 
-				uids := make([]store.UID, len(messages))
-				for i, m := range messages {
-					uids[i] = m.UID
-				}
+				err = tx.Update(&dstMB)
+				xcheckf(err, "updating uidnext and counts in destination mailbox")
+
+				srcMB.ModSeq = modseq
+				err = tx.Update(&srcMB)
+				xcheckf(err, "updating counts for inbox")
+
 				var dstFlags []string
 				if tx.Get(&store.Subscription{Name: dstMB.Name}) == nil {
 					dstFlags = []string{`\Subscribed`}
 				}
-				changes = []store.Change{
-					store.ChangeRemoveUIDs{MailboxID: srcMB.ID, UIDs: uids},
-					store.ChangeAddMailbox{Name: dstMB.Name, Flags: dstFlags},
-					// todo: in future, we could announce all messages. no one is listening now though.
+
+				// Copy any annotations. ../rfc/5464:368
+				annotations, err := bstore.QueryTx[store.Annotation](tx).FilterNonzero(store.Annotation{MailboxID: srcMB.ID}).List()
+				xcheckf(err, "get annotations to copy for inbox")
+				for i := range annotations {
+					annotations[i].ID = 0
+					annotations[i].MailboxID = dstMB.ID
+					annotations[i].ModSeq = modseq
+					annotations[i].CreateSeq = modseq
+					err := tx.Insert(&annotations[i])
+					xcheckf(err, "copy annotation to destination mailbox")
 				}
+
+				changes[0] = store.ChangeRemoveUIDs{MailboxID: srcMB.ID, UIDs: oldUIDs, ModSeq: modseq}
+				changes[1] = store.ChangeAddMailbox{Mailbox: dstMB, Flags: dstFlags, ModSeq: modseq}
+				// changes[2:...] are ChangeAddUIDs
+				changes = append(changes, srcMB.ChangeCounts(), dstMB.ChangeCounts())
+				for _, a := range annotations {
+					changes = append(changes, a.Change(dstMB.Name))
+				}
+
 				return
 			}
 
-			// We gather existing mailboxes that we need for deciding what to create/delete/update.
-			q := bstore.QueryTx[store.Mailbox](tx)
-			srcPrefix := src + "/"
-			dstRoot := strings.SplitN(dst, "/", 2)[0]
-			dstRootPrefix := dstRoot + "/"
-			q.FilterFn(func(mb store.Mailbox) bool {
-				return mb.Name == src || strings.HasPrefix(mb.Name, srcPrefix) || mb.Name == dstRoot || strings.HasPrefix(mb.Name, dstRootPrefix)
-			})
-			q.SortAsc("Name") // We'll rename the parents before children.
-			l, err := q.List()
-			xcheckf(err, "listing relevant mailboxes")
-
-			mailboxes := map[string]store.Mailbox{}
-			for _, mb := range l {
-				mailboxes[mb.Name] = mb
-			}
-
-			if _, ok := mailboxes[src]; !ok {
+			var notExists, alreadyExists bool
+			var err error
+			changes, _, notExists, alreadyExists, err = c.account.MailboxRename(tx, srcMB, dst, &modseq)
+			if notExists {
 				// ../rfc/9051:5140
-				xusercodeErrorf("NONEXISTENT", "mailbox does not exist")
+				xusercodeErrorf("NONEXISTENT", "%s", err)
+			} else if alreadyExists {
+				xusercodeErrorf("ALREADYEXISTS", "%s", err)
 			}
-
-			// Ensure parent mailboxes for the destination paths exist.
-			var parent string
-			dstElems := strings.Split(dst, "/")
-			for i, elem := range dstElems[:len(dstElems)-1] {
-				if i > 0 {
-					parent += "/"
-				}
-				parent += elem
-
-				mb, ok := mailboxes[parent]
-				if ok {
-					continue
-				}
-				omb := mb
-				mb = store.Mailbox{
-					ID:          omb.ID,
-					Name:        parent,
-					UIDValidity: uidval,
-					UIDNext:     1,
-				}
-				err = tx.Insert(&mb)
-				xcheckf(err, "creating parent mailbox")
-				err = tx.Insert(&store.Subscription{Name: parent})
-				if err != nil && !errors.Is(err, bstore.ErrUnique) {
-					xcheckf(err, "creating subscription")
-				}
-				changes = append(changes, store.ChangeAddMailbox{Name: parent, Flags: []string{`\Subscribed`}})
-			}
-
-			// Process src mailboxes, renaming them to dst.
-			for _, srcmb := range l {
-				if srcmb.Name != src && !strings.HasPrefix(srcmb.Name, srcPrefix) {
-					continue
-				}
-				srcName := srcmb.Name
-				dstName := dst + srcmb.Name[len(src):]
-				if _, ok := mailboxes[dstName]; ok {
-					xusercodeErrorf("ALREADYEXISTS", "destination mailbox %q already exists", dstName)
-				}
-
-				srcmb.Name = dstName
-				srcmb.UIDValidity = uidval
-				err = tx.Update(&srcmb)
-				xcheckf(err, "renaming mailbox")
-
-				// Renaming Inbox is special, it leaves an empty inbox instead of removing it.
-				var dstFlags []string
-				if tx.Get(&store.Subscription{Name: dstName}) == nil {
-					dstFlags = []string{`\Subscribed`}
-				}
-				changes = append(changes, store.ChangeRenameMailbox{OldName: srcName, NewName: dstName, Flags: dstFlags})
-			}
-
-			// If we renamed e.g. a/b to a/b/c/d, and a/b/c to a/b/c/d/c, we'll have to recreate a/b and a/b/c.
-			srcElems := strings.Split(src, "/")
-			xsrc := src
-			for i := 0; i < len(dstElems) && strings.HasPrefix(dst, xsrc+"/"); i++ {
-				mb := store.Mailbox{
-					UIDValidity: uidval,
-					UIDNext:     1,
-					Name:        xsrc,
-				}
-				err = tx.Insert(&mb)
-				xcheckf(err, "creating mailbox at old path")
-				xsrc += "/" + dstElems[len(srcElems)+i]
-			}
+			xcheckf(err, "renaming mailbox")
 		})
 		c.broadcast(changes)
 	})
@@ -2287,7 +3161,7 @@ func (c *conn) cmdLsub(tag, cmd string, p *parser) {
 		for _, sub := range subscriptions {
 			name := sub.Name
 			if ispercent {
-				for p := filepath.Dir(name); p != "."; p = filepath.Dir(p) {
+				for p := path.Dir(name); p != "."; p = path.Dir(p) {
 					subscribedKids[p] = true
 				}
 			}
@@ -2295,7 +3169,7 @@ func (c *conn) cmdLsub(tag, cmd string, p *parser) {
 				continue
 			}
 			have[name] = true
-			line := fmt.Sprintf(`* LSUB () "/" %s`, astring(name).pack(c))
+			line := fmt.Sprintf(`* LSUB () "/" %s`, mailboxt(name).pack(c))
 			lines = append(lines, line)
 
 		}
@@ -2310,7 +3184,7 @@ func (c *conn) cmdLsub(tag, cmd string, p *parser) {
 			if have[mb.Name] || !subscribedKids[mb.Name] || !re.MatchString(mb.Name) {
 				return nil
 			}
-			line := fmt.Sprintf(`* LSUB (\NoSelect) "/" %s`, astring(mb.Name).pack(c))
+			line := fmt.Sprintf(`* LSUB (\NoSelect) "/" %s`, mailboxt(mb.Name).pack(c))
 			lines = append(lines, line)
 			return nil
 		})
@@ -2347,8 +3221,8 @@ func (c *conn) cmdNamespace(tag, cmd string, p *parser) {
 //
 // State: Authenticated and selected.
 func (c *conn) cmdStatus(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:3328 ../rfc/3501:2424
-	// Examples: ../rfc/9051:3400 ../rfc/3501:2501
+	// Command: ../rfc/9051:3328 ../rfc/3501:2424 ../rfc/7162:1127
+	// Examples: ../rfc/9051:3400 ../rfc/3501:2501 ../rfc/7162:1139
 
 	// Request syntax: ../rfc/9051:7053 ../rfc/3501:5036
 	p.xspace()
@@ -2378,81 +3252,49 @@ func (c *conn) cmdStatus(tag, cmd string, p *parser) {
 	c.ok(tag, cmd)
 }
 
-// Response syntax: ../rfc/9051:6681 ../rfc/9051:7070 ../rfc/9051:7059 ../rfc/3501:4834
+// Response syntax: ../rfc/9051:6681 ../rfc/9051:7070 ../rfc/9051:7059 ../rfc/3501:4834 ../rfc/9208:712
 func (c *conn) xstatusLine(tx *bstore.Tx, mb store.Mailbox, attrs []string) string {
-	var count, unseen, deleted int
-	var size int64
-
-	q := bstore.QueryTx[store.Message](tx)
-	q.FilterNonzero(store.Message{MailboxID: mb.ID})
-	err := q.ForEach(func(m store.Message) error {
-		count++
-		if !m.Seen {
-			unseen++
-		}
-		if m.Deleted {
-			deleted++
-		}
-		size += m.Size
-		return nil
-	})
-	xcheckf(err, "processing mailbox messages")
-
 	status := []string{}
 	for _, a := range attrs {
 		A := strings.ToUpper(a)
 		switch A {
 		case "MESSAGES":
-			status = append(status, A, fmt.Sprintf("%d", count))
+			status = append(status, A, fmt.Sprintf("%d", mb.Total+mb.Deleted))
 		case "UIDNEXT":
 			status = append(status, A, fmt.Sprintf("%d", mb.UIDNext))
 		case "UIDVALIDITY":
 			status = append(status, A, fmt.Sprintf("%d", mb.UIDValidity))
 		case "UNSEEN":
-			status = append(status, A, fmt.Sprintf("%d", unseen))
+			status = append(status, A, fmt.Sprintf("%d", mb.Unseen))
 		case "DELETED":
-			status = append(status, A, fmt.Sprintf("%d", deleted))
+			status = append(status, A, fmt.Sprintf("%d", mb.Deleted))
 		case "SIZE":
-			status = append(status, A, fmt.Sprintf("%d", size))
+			status = append(status, A, fmt.Sprintf("%d", mb.Size))
 		case "RECENT":
 			status = append(status, A, "0")
 		case "APPENDLIMIT":
 			// ../rfc/7889:255
 			status = append(status, A, "NIL")
+		case "HIGHESTMODSEQ":
+			// ../rfc/7162:366
+			status = append(status, A, fmt.Sprintf("%d", mb.ModSeq.Client()))
+		case "DELETED-STORAGE":
+			// ../rfc/9208:394
+			// How much storage space could be reclaimed by expunging messages with the
+			// \Deleted flag. We could keep track of this number and return it efficiently.
+			// Calculating it each time can be slow, and we don't know if clients request it.
+			// Clients are not likely to set the deleted flag without immediately expunging
+			// nowadays. Let's wait for something to need it to go through the trouble, and
+			// always return 0 for now.
+			status = append(status, A, "0")
 		default:
 			xsyntaxErrorf("unknown attribute %q", a)
 		}
 	}
-	return fmt.Sprintf("* STATUS %s (%s)", astring(mb.Name).pack(c), strings.Join(status, " "))
+	return fmt.Sprintf("* STATUS %s (%s)", mailboxt(mb.Name).pack(c), strings.Join(status, " "))
 }
 
-func xparseStoreFlags(l []string, syntax bool) (flags store.Flags) {
-	fields := map[string]*bool{
-		`\answered`:  &flags.Answered,
-		`\flagged`:   &flags.Flagged,
-		`\deleted`:   &flags.Deleted,
-		`\seen`:      &flags.Seen,
-		`\draft`:     &flags.Draft,
-		`$junk`:      &flags.Junk,
-		`$notjunk`:   &flags.Notjunk,
-		`$forwarded`: &flags.Forwarded,
-		`$phishing`:  &flags.Phishing,
-		`$mdnsent`:   &flags.MDNSent,
-	}
-	for _, f := range l {
-		if field, ok := fields[strings.ToLower(f)]; !ok {
-			if syntax {
-				xsyntaxErrorf("unknown flag %q", f)
-			}
-			xuserErrorf("unknown flag %q", f)
-		} else {
-			*field = true
-		}
-	}
-	return
-}
-
-func flaglist(fl store.Flags) listspace {
+func flaglist(fl store.Flags, keywords []string) listspace {
 	l := listspace{}
 	flag := func(v bool, s string) {
 		if v {
@@ -2469,109 +3311,258 @@ func flaglist(fl store.Flags) listspace {
 	flag(fl.Notjunk, `$NotJunk`)
 	flag(fl.Phishing, `$Phishing`)
 	flag(fl.MDNSent, `$MDNSent`)
+	for _, k := range keywords {
+		l = append(l, bare(k))
+	}
 	return l
 }
 
 // Append adds a message to a mailbox.
+// The MULTIAPPEND extension is implemented, allowing multiple flags/datetime/data
+// sets.
 //
 // State: Authenticated and selected.
 func (c *conn) cmdAppend(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:3406 ../rfc/6855:204 ../rfc/3501:2527
-	// Examples: ../rfc/9051:3482 ../rfc/3501:2589
+	// Command: ../rfc/9051:3406 ../rfc/6855:204 ../rfc/4466:427 ../rfc/3501:2527 ../rfc/3502:95
+	// Examples: ../rfc/9051:3482 ../rfc/3501:2589 ../rfc/3502:175
 
-	// Request syntax: ../rfc/9051:6325 ../rfc/6855:219 ../rfc/3501:4547
+	// A message that we've (partially) read from the client, and will be delivering to
+	// the mailbox once we have them all. ../rfc/3502:49
+	type appendMsg struct {
+		storeFlags store.Flags
+		keywords   []string
+		time       time.Time
+
+		file *os.File // Message file we are appending. Can be nil if we are writing to a nopWriteCloser due to being over quota.
+		path string   // Path if an actual file, either a temporary file, or of the message file stored in the account.
+
+		mw *message.Writer
+		m  store.Message
+	}
+
+	var appends []*appendMsg
+	var committed bool
+	defer func() {
+		for _, a := range appends {
+			if a.file != nil {
+				err := a.file.Close()
+				c.xsanity(err, "closing APPEND temporary file")
+			}
+
+			if !committed && a.path != "" {
+				err := os.Remove(a.path)
+				c.xsanity(err, "removing APPEND temporary file")
+			}
+		}
+	}()
+
+	// Request syntax: ../rfc/9051:6325 ../rfc/6855:219 ../rfc/3501:4547 ../rfc/3502:218
 	p.xspace()
 	name := p.xmailbox()
 	p.xspace()
-	var storeFlags store.Flags
-	if p.hasPrefix("(") {
-		// Error must be a syntax error, to properly abort the connection due to literal.
-		storeFlags = xparseStoreFlags(p.xflagList(), true)
-		p.xspace()
-	}
-	var tm time.Time
-	if p.hasPrefix(`"`) {
-		tm = p.xdateTime()
-		p.xspace()
-	} else {
-		tm = time.Now()
-	}
-	// todo: only with utf8 should we we accept message headers with utf-8. we currently always accept them.
-	// todo: this is only relevant if we also support the CATENATE extension?
-	// ../rfc/6855:204
-	utf8 := p.take("UTF8 (")
-	size, sync := p.xliteralSize(0, utf8)
 
-	name = xcheckmailboxname(name, true)
-	c.xdbread(func(tx *bstore.Tx) {
-		c.xmailbox(tx, name, "TRYCREATE")
-	})
-	if sync {
-		c.writelinef("+")
+	// Check how much quota space is available. We'll keep track of remaining quota as
+	// we accept multiple messages.
+	quotaMsgMax := c.account.QuotaMessageSize()
+	quotaUnlimited := quotaMsgMax == 0
+	var quotaAvail int64
+	var totalSize int64
+	if !quotaUnlimited {
+		c.account.WithRLock(func() {
+			c.xdbread(func(tx *bstore.Tx) {
+				du := store.DiskUsage{ID: 1}
+				err := tx.Get(&du)
+				xcheckf(err, "get quota disk usage")
+				quotaAvail = quotaMsgMax - du.MessageSize
+			})
+		})
 	}
 
-	// Read the message into a temporary file.
-	msgFile, err := store.CreateMessageTemp("imap-append")
-	xcheckf(err, "creating temp file for message")
-	defer func() {
-		if msgFile != nil {
-			err := os.Remove(msgFile.Name())
-			c.xsanity(err, "removing APPEND temporary file")
-			err = msgFile.Close()
-			c.xsanity(err, "closing APPEND temporary file")
+	var overQuota bool // For response code.
+	var cancel bool    // In case we've seen zero-sized message append.
+
+	for {
+		// Append msg early, for potential cleanup.
+		var a appendMsg
+		appends = append(appends, &a)
+
+		if p.hasPrefix("(") {
+			// Error must be a syntax error, to properly abort the connection due to literal.
+			var err error
+			a.storeFlags, a.keywords, err = store.ParseFlagsKeywords(p.xflagList())
+			if err != nil {
+				xsyntaxErrorf("parsing flags: %v", err)
+			}
+			p.xspace()
 		}
-	}()
-	defer c.xtrace(mlog.LevelTracedata)()
-	mw := &message.Writer{Writer: msgFile}
-	msize, err := io.Copy(mw, io.LimitReader(c.br, size))
-	c.xtrace(mlog.LevelTrace) // Restore.
-	if err != nil {
-		// Cannot use xcheckf due to %w handling of errIO.
-		panic(fmt.Errorf("reading literal message: %s (%w)", err, errIO))
-	}
-	if msize != size {
-		xserverErrorf("read %d bytes for message, expected %d (%w)", msize, size, errIO)
-	}
-	msgPrefix := []byte{}
-	// todo: should we treat the message as body? i believe headers are required in messages, and bodies are optional. so would make more sense to treat the data as headers. perhaps only if the headers are valid?
-	if !mw.HaveHeaders {
-		msgPrefix = []byte("\r\n")
-	}
+		if p.hasPrefix(`"`) {
+			a.time = p.xdateTime()
+			p.xspace()
+		} else {
+			a.time = time.Now()
+		}
+		// todo: only with utf8 should we we accept message headers with utf-8. we currently always accept them.
+		// todo: this is only relevant if we also support the CATENATE extension?
+		// ../rfc/6855:204
+		utf8 := p.take("UTF8 (")
+		if utf8 {
+			p.xtake("~")
+		}
+		// Always allow literal8, for binary extension. ../rfc/4466:486
+		// For utf8, we already consumed the required ~ above.
+		size, synclit := p.xliteralSize(!utf8, false)
 
-	if utf8 {
+		if !quotaUnlimited && !overQuota {
+			quotaAvail -= size
+			overQuota = quotaAvail < 0
+		}
+		if size == 0 {
+			cancel = true
+		}
+
+		var f io.Writer
+		if synclit {
+			// Check for mailbox on first iteration.
+			if len(appends) <= 1 {
+				name = xcheckmailboxname(name, true)
+				c.xdbread(func(tx *bstore.Tx) {
+					c.xmailbox(tx, name, "TRYCREATE")
+				})
+			}
+
+			if overQuota {
+				// ../rfc/9051:5155 ../rfc/9208:472
+				xusercodeErrorf("OVERQUOTA", "account over maximum total message size %d", quotaMsgMax)
+			}
+
+			// ../rfc/3502:140
+			if cancel {
+				xuserErrorf("empty message, cancelling append")
+			}
+
+			// Read the message into a temporary file.
+			var err error
+			a.file, err = store.CreateMessageTemp(c.log, "imap-append")
+			xcheckf(err, "creating temp file for message")
+			a.path = a.file.Name()
+			f = a.file
+
+			c.writelinef("+ ")
+		} else {
+			// We'll discard the message and return an error as soon as we can (possible
+			// synchronizing literal of next message, or after we've seen all messages).
+			if overQuota || cancel {
+				f = io.Discard
+			} else {
+				var err error
+				a.file, err = store.CreateMessageTemp(c.log, "imap-append")
+				xcheckf(err, "creating temp file for message")
+				a.path = a.file.Name()
+				f = a.file
+			}
+		}
+
+		defer c.xtrace(mlog.LevelTracedata)()
+		a.mw = message.NewWriter(f)
+		msize, err := io.Copy(a.mw, io.LimitReader(c.br, size))
+		c.xtrace(mlog.LevelTrace) // Restore.
+		if err != nil {
+			// Cannot use xcheckf due to %w handling of errIO.
+			c.xbrokenf("reading literal message: %s (%w)", err, errIO)
+		}
+		if msize != size {
+			c.xbrokenf("read %d bytes for message, expected %d (%w)", msize, size, errIO)
+		}
+		totalSize += msize
+
 		line := c.readline(false)
-		np := newParser(line, c)
-		np.xtake(")")
-		np.xempty()
-	} else {
-		line := c.readline(false)
-		np := newParser(line, c)
-		np.xempty()
+		p = newParser(line, c)
+		if utf8 {
+			p.xtake(")")
+		}
+
+		// The MULTIAPPEND extension allows more appends.
+		if !p.space() {
+			break
+		}
 	}
 	p.xempty()
-	if !sync {
-		name = xcheckmailboxname(name, true)
+
+	name = xcheckmailboxname(name, true)
+
+	if overQuota {
+		// ../rfc/9208:472
+		xusercodeErrorf("OVERQUOTA", "account over maximum total message size %d", quotaMsgMax)
+	}
+
+	// ../rfc/3502:140
+	if cancel {
+		xuserErrorf("empty message, cancelling append")
 	}
 
 	var mb store.Mailbox
-	var msg store.Message
 	var pendingChanges []store.Change
 
+	// Append all messages in a single atomic transaction. ../rfc/3502:143
+
 	c.account.WithWLock(func() {
+		var changes []store.Change
+
 		c.xdbwrite(func(tx *bstore.Tx) {
 			mb = c.xmailbox(tx, name, "TRYCREATE")
-			msg = store.Message{
-				MailboxID:     mb.ID,
-				MailboxOrigID: mb.ID,
-				Received:      tm,
-				Flags:         storeFlags,
-				Size:          size,
-				MsgPrefix:     msgPrefix,
+
+			// Check quota for all messages at once.
+			ok, maxSize, err := c.account.CanAddMessageSize(tx, totalSize)
+			xcheckf(err, "checking quota")
+			if !ok {
+				// ../rfc/9208:472
+				xusercodeErrorf("OVERQUOTA", "account over maximum total message size %d", maxSize)
 			}
-			isSent := name == "Sent"
-			err := c.account.DeliverMessage(c.log, tx, &msg, msgFile, true, isSent, true, false)
-			xcheckf(err, "delivering message")
+
+			modseq, err := c.account.NextModSeq(tx)
+			xcheckf(err, "get next mod seq")
+
+			var mbKwChanged bool
+			for _, a := range appends {
+				// Ensure keywords are stored in mailbox.
+				var kwch bool
+				mb.Keywords, kwch = store.MergeKeywords(mb.Keywords, a.keywords)
+				mbKwChanged = mbKwChanged || kwch
+			}
+			if mbKwChanged {
+				changes = append(changes, mb.ChangeKeywords())
+			}
+
+			for _, a := range appends {
+				a.m = store.Message{
+					MailboxID:     mb.ID,
+					MailboxOrigID: mb.ID,
+					Received:      a.time,
+					Flags:         a.storeFlags,
+					Keywords:      a.keywords,
+					Size:          a.mw.Size,
+					ModSeq:        modseq,
+					CreateSeq:     modseq,
+				}
+				mb.Add(a.m.MailboxCounts())
+			}
+
+			// Update mailbox before delivering, which updates uidnext which we mustn't overwrite.
+			mb.ModSeq = modseq
+			err = tx.Update(&mb)
+			xcheckf(err, "updating mailbox counts")
+
+			for _, a := range appends {
+				err = c.account.DeliverMessage(c.log, tx, &a.m, a.file, true, false, false, true)
+				xcheckf(err, "delivering message")
+
+				// Update path to what is stored in the account. We may still have to clean it up on errors.
+				a.path = c.account.MessagePath(a.m.ID)
+			}
 		})
+
+		// Success, make sure messages aren't cleaned up anymore.
+		committed = true
 
 		// Fetch pending changes, possibly with new UIDs, so we can apply them before adding our own new UID.
 		if c.comm != nil {
@@ -2579,20 +3570,31 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 		}
 
 		// Broadcast the change to other connections.
-		c.broadcast([]store.Change{store.ChangeAddUID{MailboxID: mb.ID, UID: msg.UID, Flags: msg.Flags}})
+		for _, a := range appends {
+			changes = append(changes, a.m.ChangeAddUID())
+		}
+		changes = append(changes, mb.ChangeCounts())
+		c.broadcast(changes)
 	})
-
-	err = msgFile.Close()
-	c.log.Check(err, "closing appended file")
-	msgFile = nil
 
 	if c.mailboxID == mb.ID {
 		c.applyChanges(pendingChanges, false)
-		c.uidAppend(msg.UID)
+		for _, a := range appends {
+			c.uidAppend(a.m.UID)
+		}
+		// todo spec: with condstore/qresync, is there a mechanism to let the client know the modseq for the appended uid? in theory an untagged fetch with the modseq after the OK APPENDUID could make sense, but this probably isn't allowed.
 		c.bwritelinef("* %d EXISTS", len(c.uids))
 	}
 
-	c.writeresultf("%s OK [APPENDUID %d %d] appended", tag, mb.UIDValidity, msg.UID)
+	// ../rfc/4315:289 ../rfc/3502:236 APPENDUID
+	// ../rfc/4315:276 ../rfc/4315:310 UID, and UID set for multiappend
+	var uidset string
+	if len(appends) == 1 {
+		uidset = fmt.Sprintf("%d", appends[0].m.UID)
+	} else {
+		uidset = fmt.Sprintf("%d:%d", appends[0].m.UID, appends[len(appends)-1].m.UID)
+	}
+	c.writeresultf("%s OK [APPENDUID %d %s] appended", tag, mb.UIDValidity, uidset)
 }
 
 // Idle makes a client wait until the server sends untagged updates, e.g. about
@@ -2618,13 +3620,13 @@ wait:
 			xcheckf(le.err, "get line")
 			line = le.line
 			break wait
-		case changes := <-c.comm.Changes:
-			c.applyChanges(changes, false)
+		case <-c.comm.Pending:
+			c.applyChanges(c.comm.Get(), false)
 			c.xflush()
 		case <-mox.Shutdown.Done():
 			// ../rfc/9051:5375
 			c.writelinef("* BYE shutting down")
-			panic(errIO)
+			c.xbrokenf("shutting down (%w)", errIO)
 		}
 	}
 
@@ -2635,9 +3637,90 @@ wait:
 
 	if strings.ToUpper(line) != "DONE" {
 		// We just close the connection because our protocols are out of sync.
-		panic(fmt.Errorf("%w: in IDLE, expected DONE", errIO))
+		c.xbrokenf("%w: in IDLE, expected DONE", errIO)
 	}
 
+	c.ok(tag, cmd)
+}
+
+// Return the quota root for a mailbox name and any current quota's.
+//
+// State: Authenticated and selected.
+func (c *conn) cmdGetquotaroot(tag, cmd string, p *parser) {
+	// Command: ../rfc/9208:278 ../rfc/2087:141
+
+	// Request syntax: ../rfc/9208:660 ../rfc/2087:233
+	p.xspace()
+	name := p.xmailbox()
+	p.xempty()
+
+	// This mailbox does not have to exist. Caller just wants to know which limits
+	// would apply. We only have one limit, so we don't use the name otherwise.
+	// ../rfc/9208:295
+	name = xcheckmailboxname(name, true)
+
+	// Get current usage for account.
+	var quota, size int64 // Account only has a quota if > 0.
+	c.account.WithRLock(func() {
+		quota = c.account.QuotaMessageSize()
+		if quota >= 0 {
+			c.xdbread(func(tx *bstore.Tx) {
+				du := store.DiskUsage{ID: 1}
+				err := tx.Get(&du)
+				xcheckf(err, "gather used quota")
+				size = du.MessageSize
+			})
+		}
+	})
+
+	// We only have one per account quota, we name it "" like the examples in the RFC.
+	// Response syntax: ../rfc/9208:668 ../rfc/2087:242
+	c.bwritelinef(`* QUOTAROOT %s ""`, astring(name).pack(c))
+
+	// We only write the quota response if there is a limit. The syntax doesn't allow
+	// an empty list, so we cannot send the current disk usage if there is no limit.
+	if quota > 0 {
+		// Response syntax: ../rfc/9208:666 ../rfc/2087:239
+		c.bwritelinef(`* QUOTA "" (STORAGE %d %d)`, (size+1024-1)/1024, (quota+1024-1)/1024)
+	}
+	c.ok(tag, cmd)
+}
+
+// Return the quota for a quota root.
+//
+// State: Authenticated and selected.
+func (c *conn) cmdGetquota(tag, cmd string, p *parser) {
+	// Command: ../rfc/9208:245 ../rfc/2087:123
+
+	// Request syntax: ../rfc/9208:658 ../rfc/2087:231
+	p.xspace()
+	root := p.xastring()
+	p.xempty()
+
+	// We only have a per-account root called "".
+	if root != "" {
+		xuserErrorf("unknown quota root")
+	}
+
+	var quota, size int64
+	c.account.WithRLock(func() {
+		quota = c.account.QuotaMessageSize()
+		if quota > 0 {
+			c.xdbread(func(tx *bstore.Tx) {
+				du := store.DiskUsage{ID: 1}
+				err := tx.Get(&du)
+				xcheckf(err, "gather used quota")
+				size = du.MessageSize
+			})
+		}
+	})
+
+	// We only write the quota response if there is a limit. The syntax doesn't allow
+	// an empty list, so we cannot send the current disk usage if there is no limit.
+	if quota > 0 {
+		// Response syntax: ../rfc/9208:666 ../rfc/2087:239
+		c.bwritelinef(`* QUOTA "" (STORAGE %d %d)`, (size+1024-1)/1024, (quota+1024-1)/1024)
+	}
 	c.ok(tag, cmd)
 }
 
@@ -2664,40 +3747,35 @@ func (c *conn) cmdCheck(tag, cmd string, p *parser) {
 //
 // State: Selected
 func (c *conn) cmdClose(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:3636 ../rfc/3501:2652
+	// Command: ../rfc/9051:3636 ../rfc/3501:2652 ../rfc/7162:1836
 
 	// Request syntax: ../rfc/9051:6476 ../rfc/3501:4679
 	p.xempty()
 
-	if c.readonly {
-		c.unselect()
-		c.ok(tag, cmd)
-		return
+	if !c.readonly {
+		c.xexpunge(nil, true)
 	}
-
-	remove := c.xexpunge(nil, true)
-
-	defer func() {
-		for _, m := range remove {
-			p := c.account.MessagePath(m.ID)
-			err := os.Remove(p)
-			c.xsanity(err, "removing message file for expunge for close")
-		}
-	}()
-
 	c.unselect()
 	c.ok(tag, cmd)
 }
 
 // expunge messages marked for deletion in currently selected/active mailbox.
 // if uidSet is not nil, only messages matching the set are deleted.
-// messages that have been deleted from the database returned, but the corresponding files still have to be removed.
-func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
-	var remove []store.Message
+//
+// messages that have been marked expunged from the database are returned and
+// have already been removed.
+//
+// the highest modseq in the mailbox is returned, typically associated with the
+// removal of the messages, but if no messages were expunged the current latest max
+// modseq for the mailbox is returned.
+func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) (removed []store.Message, highestModSeq store.ModSeq) {
+	var modseq store.ModSeq
 
 	c.account.WithWLock(func() {
+		var mb store.Mailbox
+
 		c.xdbwrite(func(tx *bstore.Tx) {
-			mb := store.Mailbox{ID: c.mailboxID}
+			mb = store.Mailbox{ID: c.mailboxID}
 			err := tx.Get(&mb)
 			if err == bstore.ErrAbsent {
 				if missingMailboxOK {
@@ -2709,23 +3787,37 @@ func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
 			qm := bstore.QueryTx[store.Message](tx)
 			qm.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			qm.FilterEqual("Deleted", true)
+			qm.FilterEqual("Expunged", false)
 			qm.FilterFn(func(m store.Message) bool {
 				// Only remove if this session knows about the message and if present in optional uidSet.
 				return uidSearch(c.uids, m.UID) > 0 && (uidSet == nil || uidSet.containsUID(m.UID, c.uids, c.searchResult))
 			})
 			qm.SortAsc("UID")
-			remove, err = qm.List()
+			removed, err = qm.List()
 			xcheckf(err, "listing messages to delete")
 
-			if len(remove) == 0 {
+			if len(removed) == 0 {
+				highestModSeq = mb.ModSeq
 				return
 			}
 
-			removeIDs := make([]int64, len(remove))
-			anyIDs := make([]any, len(remove))
-			for i, m := range remove {
+			// Assign new modseq.
+			modseq, err = c.account.NextModSeq(tx)
+			xcheckf(err, "assigning next modseq")
+			highestModSeq = modseq
+			mb.ModSeq = modseq
+
+			removeIDs := make([]int64, len(removed))
+			anyIDs := make([]any, len(removed))
+			var totalSize int64
+			for i, m := range removed {
 				removeIDs[i] = m.ID
 				anyIDs[i] = m.ID
+				mb.Sub(m.MailboxCounts())
+				totalSize += m.Size
+				// Update "remove", because RetrainMessage below will save the message.
+				removed[i].Expunged = true
+				removed[i].ModSeq = modseq
 			}
 			qmr := bstore.QueryTx[store.Recipient](tx)
 			qmr.FilterEqual("MessageID", anyIDs...)
@@ -2734,31 +3826,49 @@ func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
 
 			qm = bstore.QueryTx[store.Message](tx)
 			qm.FilterIDs(removeIDs)
-			_, err = qm.Delete()
-			xcheckf(err, "removing messages marked for deletion")
-
-			// Mark removed messages as not needing training, then retrain them, so if they
-			// were trained, they get untrained.
-			for i := range remove {
-				remove[i].Junk = false
-				remove[i].Notjunk = false
+			n, err := qm.UpdateNonzero(store.Message{Expunged: true, ModSeq: modseq})
+			if err == nil && n != len(removeIDs) {
+				err = fmt.Errorf("only %d messages set to expunged, expected %d", n, len(removeIDs))
 			}
-			err = c.account.RetrainMessages(context.TODO(), c.log, tx, remove, true)
-			xcheckf(err, "untraining deleted messages")
+			xcheckf(err, "marking messages marked for deleted as expunged")
+
+			err = tx.Update(&mb)
+			xcheckf(err, "updating mailbox counts")
+
+			err = c.account.AddMessageSize(c.log, tx, -totalSize)
+			xcheckf(err, "updating disk usage")
+
+			// Mark expunged messages as not needing training, then retrain them, so if they
+			// were trained, they get untrained.
+			for i := range removed {
+				removed[i].Junk = false
+				removed[i].Notjunk = false
+			}
+			err = c.account.RetrainMessages(context.TODO(), c.log, tx, removed, true)
+			xcheckf(err, "untraining expunged messages")
 		})
 
 		// Broadcast changes to other connections. We may not have actually removed any
 		// messages, so take care not to send an empty update.
-		if len(remove) > 0 {
-			ouids := make([]store.UID, len(remove))
-			for i, m := range remove {
+		if len(removed) > 0 {
+			ouids := make([]store.UID, len(removed))
+			for i, m := range removed {
 				ouids[i] = m.UID
 			}
-			changes := []store.Change{store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: ouids}}
+			changes := []store.Change{
+				store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: ouids, ModSeq: modseq},
+				mb.ChangeCounts(),
+			}
 			c.broadcast(changes)
 		}
+
+		for _, m := range removed {
+			p := c.account.MessagePath(m.ID)
+			err := os.Remove(p)
+			c.xsanity(err, "removing message file for expunge")
+		}
 	})
-	return remove
+	return removed, highestModSeq
 }
 
 // Unselect is similar to close in that it closes the currently active mailbox, but
@@ -2781,7 +3891,7 @@ func (c *conn) cmdUnselect(tag, cmd string, p *parser) {
 //
 // State: Selected
 func (c *conn) cmdExpunge(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:3687 ../rfc/3501:2695
+	// Command: ../rfc/9051:3687 ../rfc/3501:2695 ../rfc/7162:1770
 
 	// Request syntax: ../rfc/9051:6476 ../rfc/3501:4679
 	p.xempty()
@@ -2798,7 +3908,7 @@ func (c *conn) cmdExpunge(tag, cmd string, p *parser) {
 //
 // State: Selected
 func (c *conn) cmdUIDExpunge(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:4775 ../rfc/4315:75
+	// Command: ../rfc/9051:4775 ../rfc/4315:75 ../rfc/7162:1873
 
 	// Request syntax: ../rfc/9051:7125 ../rfc/9051:7129 ../rfc/4315:298
 	p.xspace()
@@ -2818,24 +3928,32 @@ func (c *conn) cmdUIDExpunge(tag, cmd string, p *parser) {
 func (c *conn) cmdxExpunge(tag, cmd string, uidSet *numSet) {
 	// Command: ../rfc/9051:3687 ../rfc/3501:2695
 
-	remove := c.xexpunge(uidSet, false)
-
-	defer func() {
-		for _, m := range remove {
-			p := c.account.MessagePath(m.ID)
-			err := os.Remove(p)
-			c.xsanity(err, "removing message file for expunge")
-		}
-	}()
+	removed, highestModSeq := c.xexpunge(uidSet, false)
 
 	// Response syntax: ../rfc/9051:6742 ../rfc/3501:4864
-	for _, m := range remove {
+	var vanishedUIDs numSet
+	qresync := c.enabled[capQresync]
+	for _, m := range removed {
 		seq := c.xsequence(m.UID)
 		c.sequenceRemove(seq, m.UID)
-		c.bwritelinef("* %d EXPUNGE", seq)
+		if qresync {
+			vanishedUIDs.append(uint32(m.UID))
+		} else {
+			c.bwritelinef("* %d EXPUNGE", seq)
+		}
+	}
+	if !vanishedUIDs.empty() {
+		// VANISHED without EARLIER. ../rfc/7162:2004
+		for _, s := range vanishedUIDs.Strings(4*1024 - 32) {
+			c.bwritelinef("* VANISHED %s", s)
+		}
 	}
 
-	c.ok(tag, cmd)
+	if c.enabled[capCondstore] {
+		c.writeresultf("%s OK [HIGHESTMODSEQ %d] expunged", tag, highestModSeq.Client())
+	} else {
+		c.ok(tag, cmd)
+	}
 }
 
 // State: Selected
@@ -2886,6 +4004,16 @@ func (c *conn) cmdMove(tag, cmd string, p *parser) {
 // State: Selected
 func (c *conn) cmdUIDMove(tag, cmd string, p *parser) {
 	c.cmdxMove(true, tag, cmd, p)
+}
+
+// State: Selected
+func (c *conn) cmdReplace(tag, cmd string, p *parser) {
+	c.cmdxReplace(false, tag, cmd, p)
+}
+
+// State: Selected
+func (c *conn) cmdUIDReplace(tag, cmd string, p *parser) {
+	c.cmdxReplace(true, tag, cmd, p)
 }
 
 func (c *conn) gatherCopyMoveUIDs(isUID bool, nums numSet) ([]store.UID, []any) {
@@ -2942,8 +4070,12 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 	var mbDst store.Mailbox
 	var origUIDs, newUIDs []store.UID
 	var flags []store.Flags
+	var keywords [][]string
+	var modseq store.ModSeq // For messages in new mailbox, assigned when first message is copied.
 
 	c.account.WithWLock(func() {
+		var mbKwChanged bool
+
 		c.xdbwrite(func(tx *bstore.Tx) {
 			mbSrc := c.xmailboxID(tx, c.mailboxID) // Validate.
 			mbDst = c.xmailbox(tx, name, "TRYCREATE")
@@ -2955,22 +4087,44 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 				xuserErrorf("no matching messages to copy")
 			}
 
+			var err error
+			modseq, err = c.account.NextModSeq(tx)
+			xcheckf(err, "assigning next modseq")
+			mbSrc.ModSeq = modseq
+			mbDst.ModSeq = modseq
+
+			err = tx.Update(&mbSrc)
+			xcheckf(err, "updating source mailbox for modseq")
+
 			// Reserve the uids in the destination mailbox.
 			uidFirst := mbDst.UIDNext
 			mbDst.UIDNext += store.UID(len(uidargs))
-			err := tx.Update(&mbDst)
-			xcheckf(err, "reserve uid in destination mailbox")
 
 			// Fetch messages from database.
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			q.FilterEqual("UID", uidargs...)
+			q.FilterEqual("Expunged", false)
 			xmsgs, err := q.List()
 			xcheckf(err, "fetching messages")
 
 			if len(xmsgs) != len(uidargs) {
 				xserverErrorf("uid and message mismatch")
 			}
+
+			// See if quota allows copy.
+			var totalSize int64
+			for _, m := range xmsgs {
+				totalSize += m.Size
+			}
+			if ok, maxSize, err := c.account.CanAddMessageSize(tx, totalSize); err != nil {
+				xcheckf(err, "checking quota")
+			} else if !ok {
+				// ../rfc/9051:5155 ../rfc/9208:472
+				xusercodeErrorf("OVERQUOTA", "account over maximum total message size %d", maxSize)
+			}
+			err = c.account.AddMessageSize(c.log, tx, totalSize)
+			xcheckf(err, "updating disk usage")
 
 			msgs := map[store.UID]store.Message{}
 			for _, m := range xmsgs {
@@ -2979,6 +4133,9 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 			nmsgs := make([]store.Message, len(xmsgs))
 
 			conf, _ := c.account.Conf()
+
+			mbKeywords := map[string]struct{}{}
+			now := time.Now()
 
 			// Insert new messages into database.
 			var origMsgIDs, newMsgIDs []int64
@@ -2991,14 +4148,18 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 				origMsgIDs = append(origMsgIDs, origID)
 				m.ID = 0
 				m.UID = uidFirst + store.UID(i)
+				m.CreateSeq = modseq
+				m.ModSeq = modseq
 				m.MailboxID = mbDst.ID
-				if mbSrc.Name == conf.RejectsMailbox && m.MailboxDestinedID != 0 {
+				if m.IsReject && m.MailboxDestinedID != 0 {
 					// Incorrectly delivered to Rejects mailbox. Adjust MailboxOrigID so this message
 					// is used for reputation calculation during future deliveries.
 					m.MailboxOrigID = m.MailboxDestinedID
+					m.IsReject = false
 				}
 				m.TrainedJunk = nil
-				m.JunkFlagsForMailbox(mbDst.Name, conf)
+				m.JunkFlagsForMailbox(mbDst, conf)
+				m.SaveDate = &now
 				err := tx.Insert(&m)
 				xcheckf(err, "inserting message")
 				msgs[uid] = m
@@ -3007,6 +4168,10 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 				newUIDs = append(newUIDs, m.UID)
 				newMsgIDs = append(newMsgIDs, m.ID)
 				flags = append(flags, m.Flags)
+				keywords = append(keywords, m.Keywords)
+				for _, kw := range m.Keywords {
+					mbKeywords[kw] = struct{}{}
+				}
 
 				qmr := bstore.QueryTx[store.Recipient](tx)
 				qmr.FilterNonzero(store.Recipient{MessageID: origID})
@@ -3018,16 +4183,33 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 					err := tx.Insert(&mr)
 					xcheckf(err, "inserting message recipient")
 				}
+
+				mbDst.Add(m.MailboxCounts())
 			}
 
+			mbDst.Keywords, mbKwChanged = store.MergeKeywords(mbDst.Keywords, maps.Keys(mbKeywords))
+
+			err = tx.Update(&mbDst)
+			xcheckf(err, "updating destination mailbox for uids, keywords and counts")
+
 			// Copy message files to new message ID's.
+			syncDirs := map[string]struct{}{}
 			for i := range origMsgIDs {
 				src := c.account.MessagePath(origMsgIDs[i])
 				dst := c.account.MessagePath(newMsgIDs[i])
-				os.MkdirAll(filepath.Dir(dst), 0770) // todo optimization: keep track of dirs we already created, don't create them again
-				err := c.linkOrCopyFile(dst, src)
+				dstdir := filepath.Dir(dst)
+				if _, ok := syncDirs[dstdir]; !ok {
+					os.MkdirAll(dstdir, 0770)
+					syncDirs[dstdir] = struct{}{}
+				}
+				err := moxio.LinkOrCopy(c.log, dst, src, nil, true)
 				xcheckf(err, "link or copy file %q to %q", src, dst)
 				createdIDs = append(createdIDs, newMsgIDs[i])
+			}
+
+			for dir := range syncDirs {
+				err := moxio.SyncDir(c.log, dir)
+				xcheckf(err, "sync directory")
 			}
 
 			err = c.account.RetrainMessages(context.TODO(), c.log, tx, nmsgs, false)
@@ -3036,9 +4218,13 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 
 		// Broadcast changes to other connections.
 		if len(newUIDs) > 0 {
-			changes := make([]store.Change, len(newUIDs))
+			changes := make([]store.Change, 0, len(newUIDs)+2)
 			for i, uid := range newUIDs {
-				changes[i] = store.ChangeAddUID{MailboxID: mbDst.ID, UID: uid, Flags: flags[i]}
+				changes = append(changes, store.ChangeAddUID{MailboxID: mbDst.ID, UID: uid, ModSeq: modseq, Flags: flags[i], Keywords: keywords[i]})
+			}
+			changes = append(changes, mbDst.ChangeCounts())
+			if mbKwChanged {
+				changes = append(changes, mbDst.ChangeKeywords())
 			}
 			c.broadcast(changes)
 		}
@@ -3051,56 +4237,13 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 	c.writeresultf("%s OK [COPYUID %d %s %s] copied", tag, mbDst.UIDValidity, compactUIDSet(origUIDs).String(), compactUIDSet(newUIDs).String())
 }
 
-func (c *conn) linkOrCopyFile(dst, src string) error {
-	// Try hardlink first.
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-
-	// File system may not support hardlinks, or link would cross file systems. Do a regular file copy.
-	sf, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		err := sf.Close()
-		c.xsanity(err, "closing copied src file")
-	}()
-
-	df, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0660)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if df != nil {
-			err = os.Remove(df.Name())
-			c.xsanity(err, "removing unfinished dst file")
-			err = df.Close()
-			c.xsanity(err, "closing unfinished dst file")
-		}
-	}()
-
-	if _, err := io.Copy(df, sf); err != nil {
-		return err
-	}
-	if err := df.Close(); err != nil {
-		xerr := os.Remove(df.Name())
-		c.xsanity(xerr, "removing unfinished dst file")
-		df = nil
-		return err
-	}
-	// todo: may need to do a file/dir sync to flush to disk. better to do it once after multiple linkOrCopyFile calls.
-	df = nil
-	return nil
-}
-
 // Move moves messages from the currently selected/active mailbox to a named mailbox.
 //
 // State: Selected
 func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:4650 ../rfc/6851:119
+	// Command: ../rfc/9051:4650 ../rfc/6851:119 ../rfc/6851:265
 
-	// Request syntax: ../rfc/6851:320 ../rfc/9051:6744
+	// Request syntax: ../rfc/6851:320
 	p.xspace()
 	nums := p.xnumSet()
 	p.xspace()
@@ -3115,13 +4258,14 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 
 	uids, uidargs := c.gatherCopyMoveUIDs(isUID, nums)
 
-	var mbDst store.Mailbox
+	var mbSrc, mbDst store.Mailbox
 	var changes []store.Change
 	var newUIDs []store.UID
+	var modseq store.ModSeq
 
 	c.account.WithWLock(func() {
 		c.xdbwrite(func(tx *bstore.Tx) {
-			mbSrc := c.xmailboxID(tx, c.mailboxID) // Validate.
+			mbSrc = c.xmailboxID(tx, c.mailboxID) // Validate.
 			mbDst = c.xmailbox(tx, name, "TRYCREATE")
 			if mbDst.ID == c.mailboxID {
 				xuserErrorf("cannot move to currently selected mailbox")
@@ -3135,13 +4279,22 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 			uidFirst := mbDst.UIDNext
 			uidnext := uidFirst
 			mbDst.UIDNext += store.UID(len(uids))
-			err := tx.Update(&mbDst)
-			xcheckf(err, "reserve uids in destination mailbox")
 
-			// Update UID and MailboxID in database for messages.
+			// Assign a new modseq, for the new records and for the expunged records.
+			var err error
+			modseq, err = c.account.NextModSeq(tx)
+			xcheckf(err, "assigning next modseq")
+			mbSrc.ModSeq = modseq
+			mbDst.ModSeq = modseq
+
+			// Update existing record with new UID and MailboxID in database for messages. We
+			// add a new but expunged record again in the original/source mailbox, for qresync.
+			// Keeping the original ID for the live message means we don't have to move the
+			// on-disk message contents file.
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			q.FilterEqual("UID", uidargs...)
+			q.FilterEqual("Expunged", false)
 			q.SortAsc("UID")
 			msgs, err := q.List()
 			xcheckf(err, "listing messages to move")
@@ -3150,35 +4303,74 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 				xserverErrorf("uid and message mismatch")
 			}
 
+			keywords := map[string]struct{}{}
+			now := time.Now()
+
 			conf, _ := c.account.Conf()
 			for i := range msgs {
 				m := &msgs[i]
 				if m.UID != uids[i] {
 					xserverErrorf("internal error: got uid %d, expected %d, for index %d", m.UID, uids[i], i)
 				}
+
+				mbSrc.Sub(m.MailboxCounts())
+
+				// Copy of message record that we'll insert when UID is freed up.
+				om := *m
+				om.PrepareExpunge()
+				om.ID = 0 // Assign new ID.
+				om.ModSeq = modseq
+
 				m.MailboxID = mbDst.ID
-				if mbSrc.Name == conf.RejectsMailbox && m.MailboxDestinedID != 0 {
+				if m.IsReject && m.MailboxDestinedID != 0 {
 					// Incorrectly delivered to Rejects mailbox. Adjust MailboxOrigID so this message
 					// is used for reputation calculation during future deliveries.
 					m.MailboxOrigID = m.MailboxDestinedID
+					m.IsReject = false
+					m.Seen = false
 				}
+				mbDst.Add(m.MailboxCounts())
 				m.UID = uidnext
-				m.JunkFlagsForMailbox(mbDst.Name, conf)
+				m.ModSeq = modseq
+				m.JunkFlagsForMailbox(mbDst, conf)
+				m.SaveDate = &now
 				uidnext++
 				err := tx.Update(m)
 				xcheckf(err, "updating moved message in database")
+
+				// Now that UID is unused, we can insert the old record again.
+				err = tx.Insert(&om)
+				xcheckf(err, "inserting record for expunge after moving message")
+
+				for _, kw := range m.Keywords {
+					keywords[kw] = struct{}{}
+				}
 			}
+
+			// Ensure destination mailbox has keywords of the moved messages.
+			var mbKwChanged bool
+			mbDst.Keywords, mbKwChanged = store.MergeKeywords(mbDst.Keywords, maps.Keys(keywords))
+			if mbKwChanged {
+				changes = append(changes, mbDst.ChangeKeywords())
+			}
+
+			err = tx.Update(&mbSrc)
+			xcheckf(err, "updating source mailbox counts and modseq")
+
+			err = tx.Update(&mbDst)
+			xcheckf(err, "updating destination mailbox for uids, keywords and counts")
 
 			err = c.account.RetrainMessages(context.TODO(), c.log, tx, msgs, false)
 			xcheckf(err, "retraining messages after move")
 
 			// Prepare broadcast changes to other connections.
-			changes = make([]store.Change, 0, 1+len(msgs))
-			changes = append(changes, store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: uids})
+			changes = make([]store.Change, 0, 1+len(msgs)+2)
+			changes = append(changes, store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: uids, ModSeq: modseq})
 			for _, m := range msgs {
 				newUIDs = append(newUIDs, m.UID)
-				changes = append(changes, store.ChangeAddUID{MailboxID: mbDst.ID, UID: m.UID, Flags: m.Flags})
+				changes = append(changes, m.ChangeAddUID())
 			}
+			changes = append(changes, mbSrc.ChangeCounts(), mbDst.ChangeCounts())
 		})
 
 		c.broadcast(changes)
@@ -3187,13 +4379,30 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 	// ../rfc/9051:4708 ../rfc/6851:254
 	// ../rfc/9051:4713
 	c.bwritelinef("* OK [COPYUID %d %s %s] moved", mbDst.UIDValidity, compactUIDSet(uids).String(), compactUIDSet(newUIDs).String())
+	qresync := c.enabled[capQresync]
+	var vanishedUIDs numSet
 	for i := 0; i < len(uids); i++ {
 		seq := c.xsequence(uids[i])
 		c.sequenceRemove(seq, uids[i])
-		c.bwritelinef("* %d EXPUNGE", seq)
+		if qresync {
+			vanishedUIDs.append(uint32(uids[i]))
+		} else {
+			c.bwritelinef("* %d EXPUNGE", seq)
+		}
+	}
+	if !vanishedUIDs.empty() {
+		// VANISHED without EARLIER. ../rfc/7162:2004
+		for _, s := range vanishedUIDs.Strings(4*1024 - 32) {
+			c.bwritelinef("* VANISHED %s", s)
+		}
 	}
 
-	c.ok(tag, cmd)
+	if qresync {
+		// ../rfc/9051:6744 ../rfc/7162:1334
+		c.writeresultf("%s OK [HIGHESTMODSEQ %d] move", tag, modseq.Client())
+	} else {
+		c.ok(tag, cmd)
+	}
 }
 
 // Store sets a full set of flags, or adds/removes specific flags.
@@ -3202,10 +4411,22 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 	// Command: ../rfc/9051:4543 ../rfc/3501:3214
 
-	// Request syntax: ../rfc/9051:7076 ../rfc/3501:5052
+	// Request syntax: ../rfc/9051:7076 ../rfc/3501:5052 ../rfc/4466:691 ../rfc/7162:2471
 	p.xspace()
 	nums := p.xnumSet()
 	p.xspace()
+	var unchangedSince *int64
+	if p.take("(") {
+		// ../rfc/7162:2471
+		p.xtake("UNCHANGEDSINCE")
+		p.xspace()
+		v := p.xnumber64()
+		unchangedSince = &v
+		p.xtake(")")
+		p.xspace()
+		// UNCHANGEDSINCE is a CONDSTORE-enabling parameter ../rfc/7162:382
+		c.xensureCondstore(nil)
+	}
 	var plus, minus bool
 	if p.take("+") {
 		plus = true
@@ -3230,25 +4451,32 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 		xuserErrorf("mailbox open in read-only mode")
 	}
 
-	var mask, flags store.Flags
+	flags, keywords, err := store.ParseFlagsKeywords(flagstrs)
+	if err != nil {
+		xuserErrorf("parsing flags: %v", err)
+	}
+	var mask store.Flags
 	if plus {
-		mask = xparseStoreFlags(flagstrs, false)
-		flags = store.FlagsAll
+		mask, flags = flags, store.FlagsAll
 	} else if minus {
-		mask = xparseStoreFlags(flagstrs, false)
-		flags = store.Flags{}
+		mask, flags = flags, store.Flags{}
 	} else {
 		mask = store.FlagsAll
-		flags = xparseStoreFlags(flagstrs, false)
 	}
 
-	updates := store.FlagsQuerySet(mask, flags)
-
+	var mb, origmb store.Mailbox
 	var updated []store.Message
+	var changed []store.Message // ModSeq more recent than unchangedSince, will be in MODIFIED response code, and we will send untagged fetch responses so client is up to date.
+	var modseq store.ModSeq     // Assigned when needed.
+	modified := map[int64]bool{}
 
 	c.account.WithWLock(func() {
+		var mbKwChanged bool
+		var changes []store.Change
+
 		c.xdbwrite(func(tx *bstore.Tx) {
-			c.xmailboxID(tx, c.mailboxID) // Validate.
+			mb = c.xmailboxID(tx, c.mailboxID) // Validate.
+			origmb = mb
 
 			uidargs := c.xnumSetCondition(isUID, nums)
 
@@ -3256,37 +4484,161 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 				return
 			}
 
+			// Ensure keywords are in mailbox.
+			if !minus {
+				mb.Keywords, mbKwChanged = store.MergeKeywords(mb.Keywords, keywords)
+				if mbKwChanged {
+					err := tx.Update(&mb)
+					xcheckf(err, "updating mailbox with keywords")
+				}
+			}
+
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			q.FilterEqual("UID", uidargs...)
-			if len(updates) == 0 {
-				var err error
-				updated, err = q.List()
-				xcheckf(err, "listing for flags")
-			} else {
-				q.Gather(&updated)
-				_, err := q.UpdateFields(updates)
-				xcheckf(err, "updating flags")
+			q.FilterEqual("Expunged", false)
+			err := q.ForEach(func(m store.Message) error {
+				// Client may specify a message multiple times, but we only process it once. ../rfc/7162:823
+				if modified[m.ID] {
+					return nil
+				}
+
+				mc := m.MailboxCounts()
+
+				origFlags := m.Flags
+				m.Flags = m.Flags.Set(mask, flags)
+				oldKeywords := append([]string{}, m.Keywords...)
+				if minus {
+					m.Keywords, _ = store.RemoveKeywords(m.Keywords, keywords)
+				} else if plus {
+					m.Keywords, _ = store.MergeKeywords(m.Keywords, keywords)
+				} else {
+					m.Keywords = keywords
+				}
+
+				keywordsChanged := func() bool {
+					sort.Strings(oldKeywords)
+					n := append([]string{}, m.Keywords...)
+					sort.Strings(n)
+					return !slices.Equal(oldKeywords, n)
+				}
+
+				// If the message has a more recent modseq than the check requires, we won't modify
+				// it and report in the final command response.
+				// ../rfc/7162:555
+				//
+				// unchangedSince 0 always fails the check, we don't turn it into 1 like with our
+				// internal modseqs. RFC implies that is not required for non-system flags, but we
+				// don't have per-flag modseq and this seems reasonable. ../rfc/7162:640
+				if unchangedSince != nil && m.ModSeq.Client() > *unchangedSince {
+					changed = append(changed, m)
+					return nil
+				}
+
+				// Note: we don't perform the optimization described in ../rfc/7162:1258
+				// It requires that we keep track of the flags we think the client knows (but only
+				// on this connection). We don't track that. It also isn't clear why this is
+				// allowed because it is skipping the condstore conditional check, and the new
+				// combination of flags could be unintended.
+
+				// We do not assign a new modseq if nothing actually changed. ../rfc/7162:1246 ../rfc/7162:312
+				if origFlags == m.Flags && !keywordsChanged() {
+					// Note: since we didn't update the modseq, we are not adding m.ID to "modified",
+					// it would skip the modseq check above. We still add m to list of updated, so we
+					// send an untagged fetch response. But we don't broadcast it.
+					updated = append(updated, m)
+					return nil
+				}
+
+				mb.Sub(mc)
+				mb.Add(m.MailboxCounts())
+
+				// Assign new modseq for first actual change.
+				if modseq == 0 {
+					var err error
+					modseq, err = c.account.NextModSeq(tx)
+					xcheckf(err, "next modseq")
+				}
+				m.ModSeq = modseq
+				modified[m.ID] = true
+				updated = append(updated, m)
+
+				changes = append(changes, m.ChangeFlags(origFlags))
+
+				return tx.Update(&m)
+			})
+			xcheckf(err, "storing flags in messages")
+
+			if mb.MailboxCounts != origmb.MailboxCounts || modseq != 0 {
+				mb.ModSeq = modseq
+				err := tx.Update(&mb)
+				xcheckf(err, "updating mailbox counts")
+
+				changes = append(changes, mb.ChangeCounts())
+			}
+			if mbKwChanged {
+				changes = append(changes, mb.ChangeKeywords())
 			}
 
-			err := c.account.RetrainMessages(context.TODO(), c.log, tx, updated, false)
+			err = c.account.RetrainMessages(context.TODO(), c.log, tx, updated, false)
 			xcheckf(err, "training messages")
 		})
 
-		// Broadcast changes to other connections.
-		changes := make([]store.Change, len(updated))
-		for i, m := range updated {
-			changes[i] = store.ChangeFlags{MailboxID: m.MailboxID, UID: m.UID, Mask: mask, Flags: m.Flags}
-		}
 		c.broadcast(changes)
 	})
 
-	for _, m := range updated {
-		if !silent {
-			// ../rfc/9051:6749 ../rfc/3501:4869
-			c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", c.xsequence(m.UID), m.UID, flaglist(m.Flags).pack(c))
+	// In the RFC, the section about STORE/UID STORE says we must return MODSEQ when
+	// UNCHANGEDSINCE was specified. It does not specify it in case UNCHANGEDSINCE
+	// isn't specified. For that case it does say MODSEQ is needed in unsolicited
+	// untagged fetch responses. Implying that solicited untagged fetch responses
+	// should not include MODSEQ (why else mention unsolicited explicitly?). But, in
+	// the introduction to CONDSTORE it does explicitly specify MODSEQ should be
+	// included in untagged fetch responses at all times with CONDSTORE-enabled
+	// connections. It would have been better if the command behaviour was specified in
+	// the command section, not the introduction to the extension.
+	// ../rfc/7162:388 ../rfc/7162:852
+	// ../rfc/7162:549
+	if !silent || c.enabled[capCondstore] {
+		for _, m := range updated {
+			var flags string
+			if !silent {
+				flags = fmt.Sprintf(" FLAGS %s", flaglist(m.Flags, m.Keywords).pack(c))
+			}
+			var modseqStr string
+			if c.enabled[capCondstore] {
+				modseqStr = fmt.Sprintf(" MODSEQ (%d)", m.ModSeq.Client())
+			}
+			// ../rfc/9051:6749 ../rfc/3501:4869 ../rfc/7162:2490
+			c.bwritelinef("* %d FETCH (UID %d%s%s)", c.xsequence(m.UID), m.UID, flags, modseqStr)
 		}
 	}
 
-	c.ok(tag, cmd)
+	// We don't explicitly send flags for failed updated with silent set. The regular
+	// notification will get the flags to the client.
+	// ../rfc/7162:630 ../rfc/3501:3233
+
+	if len(changed) == 0 {
+		c.ok(tag, cmd)
+		return
+	}
+
+	// Write unsolicited untagged fetch responses for messages that didn't pass the
+	// unchangedsince check. ../rfc/7162:679
+	// Also gather UIDs or sequences for the MODIFIED response below. ../rfc/7162:571
+	var mnums []store.UID
+	for _, m := range changed {
+		c.bwritelinef("* %d FETCH (UID %d FLAGS %s MODSEQ (%d))", c.xsequence(m.UID), m.UID, flaglist(m.Flags, m.Keywords).pack(c), m.ModSeq.Client())
+		if isUID {
+			mnums = append(mnums, m.UID)
+		} else {
+			mnums = append(mnums, store.UID(c.xsequence(m.UID)))
+		}
+	}
+
+	sort.Slice(mnums, func(i, j int) bool {
+		return mnums[i] < mnums[j]
+	})
+	set := compactUIDSet(mnums)
+	// ../rfc/7162:2506
+	c.writeresultf("%s OK [MODIFIED %s] conditional store did not modify all", tag, set.String())
 }

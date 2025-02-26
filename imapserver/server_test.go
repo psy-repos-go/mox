@@ -10,16 +10,23 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/mjl-/mox/imapclient"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/moxvar"
 	"github.com/mjl-/mox/store"
 )
+
+var ctxbg = context.Background()
+var pkglog = mlog.New("imapserver", nil)
 
 func init() {
 	sanityChecks = true
@@ -27,6 +34,8 @@ func init() {
 	// Don't slow down tests.
 	badClientDelay = 0
 	authFailDelay = 0
+
+	mox.Context = ctxbg
 }
 
 func tocrlf(s string) string {
@@ -156,6 +165,8 @@ type testconn struct {
 	client     *imapclient.Conn
 	done       chan struct{}
 	serverConn net.Conn
+	account    *store.Account
+	switchStop func()
 
 	// Result of last command.
 	lastUntagged []imapclient.Untagged
@@ -190,9 +201,15 @@ func (tc *testconn) xcodeArg(v any) {
 	}
 }
 
-func (tc *testconn) xuntagged(exps ...any) {
+func (tc *testconn) xuntagged(exps ...imapclient.Untagged) {
+	tc.t.Helper()
+	tc.xuntaggedOpt(true, exps...)
+}
+
+func (tc *testconn) xuntaggedOpt(all bool, exps ...imapclient.Untagged) {
 	tc.t.Helper()
 	last := append([]imapclient.Untagged{}, tc.lastUntagged...)
+	var mismatch any
 next:
 	for ei, exp := range exps {
 		for i, l := range last {
@@ -200,11 +217,15 @@ next:
 				continue
 			}
 			if !reflect.DeepEqual(l, exp) {
-				tc.t.Fatalf("untagged data mismatch, got:\n\t%T %#v\nexpected:\n\t%T %#v", l, l, exp, exp)
+				mismatch = l
+				continue
 			}
 			copy(last[i:], last[i+1:])
 			last = last[:len(last)-1]
 			continue next
+		}
+		if mismatch != nil {
+			tc.t.Fatalf("untagged data mismatch, got:\n\t%T %#v\nexpected:\n\t%T %#v", mismatch, mismatch, exp, exp)
 		}
 		var next string
 		if len(tc.lastUntagged) > 0 {
@@ -212,7 +233,7 @@ next:
 		}
 		tc.t.Fatalf("did not find untagged response %#v %T (%d) in %v%s", exp, exp, ei, tc.lastUntagged, next)
 	}
-	if len(last) > 0 {
+	if len(last) > 0 && all {
 		tc.t.Fatalf("leftover untagged responses %v", last)
 	}
 }
@@ -288,72 +309,179 @@ func (tc *testconn) waitDone() {
 }
 
 func (tc *testconn) close() {
-	tc.client.Close()
+	defer func() {
+		if unhandledPanics.Swap(0) > 0 {
+			tc.t.Fatalf("handled panic in server")
+		}
+	}()
+
+	if tc.account == nil {
+		// Already closed, we are not strict about closing multiple times.
+		return
+	}
+	err := tc.account.Close()
+	tc.check(err, "close account")
+	// no account.CheckClosed(), the tests open accounts multiple times.
+	tc.account = nil
+	if tc.client != nil {
+		tc.client.Close()
+	}
 	tc.serverConn.Close()
 	tc.waitDone()
+	if tc.switchStop != nil {
+		tc.switchStop()
+	}
+}
+
+func xparseNumSet(s string) imapclient.NumSet {
+	ns, err := imapclient.ParseNumSet(s)
+	if err != nil {
+		panic(fmt.Sprintf("parsing numset %s: %s", s, err))
+	}
+	return ns
+}
+
+func xparseUIDRange(s string) imapclient.NumRange {
+	nr, err := imapclient.ParseUIDRange(s)
+	if err != nil {
+		panic(fmt.Sprintf("parsing uid range %s: %s", s, err))
+	}
+	return nr
+}
+
+func makeAppend(msg string) imapclient.Append {
+	return imapclient.Append{Size: int64(len(msg)), Data: strings.NewReader(msg)}
+}
+
+func makeAppendTime(msg string, tm time.Time) imapclient.Append {
+	return imapclient.Append{Received: &tm, Size: int64(len(msg)), Data: strings.NewReader(msg)}
 }
 
 var connCounter int64
 
 func start(t *testing.T) *testconn {
-	return startArgs(t, true, false, true)
+	return startArgs(t, true, false, true, true, "mjl")
 }
 
 func startNoSwitchboard(t *testing.T) *testconn {
-	return startArgs(t, false, false, true)
+	return startArgs(t, false, false, true, false, "mjl")
 }
 
-func startArgs(t *testing.T, first, isTLS, allowLoginWithoutTLS bool) *testconn {
+const password0 = "te\u0301st \u00a0\u2002\u200a" // NFD and various unicode spaces.
+const password1 = "tést    "                      // PRECIS normalized, with NFC.
+
+func startArgs(t *testing.T, first, immediateTLS bool, allowLoginWithoutTLS, setPassword bool, accname string) *testconn {
+	return startArgsMore(t, first, immediateTLS, nil, nil, allowLoginWithoutTLS, false, setPassword, accname, nil)
+}
+
+// namedConn wraps a conn so it can return a RemoteAddr with a non-empty name.
+// The TLS resumption test needs a non-empty name, but on BSDs, the unix domain
+// socket pair has an empty peer name.
+type namedConn struct {
+	net.Conn
+}
+
+func (c namedConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.10"), Port: 1234}
+}
+
+// todo: the parameters and usage are too much now. change to scheme similar to smtpserver, with params in a struct, and a separate method for init and making a connection.
+func startArgsMore(t *testing.T, first, immediateTLS bool, serverConfig, clientConfig *tls.Config, allowLoginWithoutTLS, noCloseSwitchboard, setPassword bool, accname string, afterInit func() error) *testconn {
 	limitersInit() // Reset rate limiters.
 
 	if first {
+		mox.ConfigStaticPath = filepath.FromSlash("../testdata/imap/mox.conf")
+		mox.MustLoadConfig(true, false)
+		store.Close() // May not be open, we ignore error.
 		os.RemoveAll("../testdata/imap/data")
+		err := store.Init(ctxbg)
+		tcheck(t, err, "store init")
 	}
-	mox.Context = context.Background()
-	mox.ConfigStaticPath = "../testdata/imap/mox.conf"
-	mox.MustLoadConfig(false)
-	acc, err := store.OpenAccount("mjl")
+	acc, err := store.OpenAccount(pkglog, accname, false)
 	tcheck(t, err, "open account")
-	if first {
-		err = acc.SetPassword("testtest")
+	if setPassword {
+		err = acc.SetPassword(pkglog, password0)
 		tcheck(t, err, "set password")
 	}
-	err = acc.Close()
-	tcheck(t, err, "close account")
-	var switchDone chan struct{}
+	switchStop := func() {}
 	if first {
-		switchDone = store.Switchboard()
-	} else {
-		switchDone = make(chan struct{}) // Dummy, that can be closed.
+		switchStop = store.Switchboard()
 	}
 
-	serverConn, clientConn := net.Pipe()
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{fakeCert(t)},
+	if afterInit != nil {
+		err := afterInit()
+		tcheck(t, err, "after init")
 	}
-	if isTLS {
-		serverConn = tls.Server(serverConn, tlsConfig)
-		clientConn = tls.Client(clientConn, &tls.Config{InsecureSkipVerify: true})
+
+	// We get actual sockets for their buffering behaviour. net.Pipe is synchronous,
+	// and the implementation of the compress extension can write a sync message to an
+	// imap client when that client isn't reading but is trying to write. In the real
+	// world, network buffer will take up those few bytes, so assume the buffer in the
+	// test too.
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	tcheck(t, err, "socketpair")
+	xfdconn := func(fd int, name string) net.Conn {
+		f := os.NewFile(uintptr(fd), name)
+		fc, err := net.FileConn(f)
+		tcheck(t, err, "fileconn")
+		err = f.Close()
+		tcheck(t, err, "close file for conn")
+
+		// Small read/write buffers, for detecting closed/broken connections quickly.
+		uc := fc.(*net.UnixConn)
+		err = uc.SetReadBuffer(512)
+		tcheck(t, err, "set read buffer")
+		uc.SetWriteBuffer(512)
+		tcheck(t, err, "set write buffer")
+
+		return namedConn{uc}
+	}
+	serverConn := xfdconn(fds[0], "server")
+	clientConn := xfdconn(fds[1], "client")
+
+	if serverConfig == nil {
+		serverConfig = &tls.Config{
+			Certificates: []tls.Certificate{fakeCert(t, false)},
+		}
+	}
+	if immediateTLS {
+		if clientConfig == nil {
+			clientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		clientConn = tls.Client(clientConn, clientConfig)
 	}
 
 	done := make(chan struct{})
-	connCounter++
-	cid := connCounter
+	connCounter += 2
+	cid := connCounter - 1
 	go func() {
-		serve("test", cid, tlsConfig, serverConn, isTLS, allowLoginWithoutTLS)
-		close(switchDone)
+		const viaHTTPS = false
+		serve("test", cid, serverConfig, serverConn, immediateTLS, allowLoginWithoutTLS, viaHTTPS, "")
+		if !noCloseSwitchboard {
+			switchStop()
+		}
 		close(done)
 	}()
-	client, err := imapclient.New(clientConn, true)
+	client, err := imapclient.New(connCounter, clientConn, true)
 	tcheck(t, err, "new client")
-	return &testconn{t: t, conn: clientConn, client: client, done: done, serverConn: serverConn}
+	tc := &testconn{t: t, conn: clientConn, client: client, done: done, serverConn: serverConn, account: acc}
+	if first && noCloseSwitchboard {
+		tc.switchStop = switchStop
+	}
+	return tc
 }
 
-func fakeCert(t *testing.T) tls.Certificate {
-	privKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)) // Fake key, don't use this for real!
+func fakeCert(t *testing.T, randomkey bool) tls.Certificate {
+	seed := make([]byte, ed25519.SeedSize)
+	if randomkey {
+		cryptorand.Read(seed)
+	}
+	privKey := ed25519.NewKeyFromSeed(seed) // Fake key, don't use this for real!
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1), // Required field...
+		// Valid period is needed to get session resumption enabled.
+		NotBefore: time.Now().Add(-time.Minute),
+		NotAfter:  time.Now().Add(time.Hour),
 	}
 	localCertBuf, err := x509.CreateCertificate(cryptorand.Reader, template, template, privKey.Public(), privKey)
 	if err != nil {
@@ -378,17 +506,21 @@ func TestLogin(t *testing.T) {
 	tc.transactf("bad", "login too many args")
 	tc.transactf("bad", "login") // no args
 	tc.transactf("no", "login mjl@mox.example badpass")
-	tc.transactf("no", "login mjl testtest") // must use email, not account
+	tc.transactf("no", `login mjl "%s"`, password0) // must use email, not account
 	tc.transactf("no", "login mjl@mox.example test")
 	tc.transactf("no", "login mjl@mox.example testtesttest")
 	tc.transactf("no", `login "mjl@mox.example" "testtesttest"`)
 	tc.transactf("no", "login \"m\xf8x@mox.example\" \"testtesttest\"")
-	tc.transactf("ok", "login mjl@mox.example testtest")
+	tc.transactf("ok", `login mjl@mox.example "%s"`, password0)
 	tc.close()
 
 	tc = start(t)
+	tc.transactf("ok", `login "mjl@mox.example" "%s"`, password0)
+	tc.close()
+
+	tc = start(t)
+	tc.transactf("ok", `login "\"\"@mox.example" "%s"`, password0)
 	defer tc.close()
-	tc.transactf("ok", `login "mjl@mox.example" "testtest"`)
 
 	tc.transactf("bad", "logout badarg")
 	tc.transactf("ok", "logout")
@@ -416,7 +548,7 @@ func TestState(t *testing.T) {
 	}
 
 	// Some commands not allowed when authenticated.
-	tc.transactf("ok", "login mjl@mox.example testtest")
+	tc.transactf("ok", `login mjl@mox.example "%s"`, password0)
 	for _, cmd := range append(append([]string{}, notAuthenticated...), selected...) {
 		tc.transactf("no", "%s", cmd)
 	}
@@ -441,8 +573,8 @@ func TestLiterals(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
 
-	tc.client.Login("mjl@mox.example", "testtest")
-	tc.client.Create("tmpbox")
+	tc.client.Login("mjl@mox.example", password0)
+	tc.client.Create("tmpbox", nil)
 
 	tc.transactf("ok", "rename {6+}\r\ntmpbox {7+}\r\nntmpbox")
 
@@ -464,7 +596,7 @@ func TestLiterals(t *testing.T) {
 func TestScenario(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
-	tc.transactf("ok", "login mjl@mox.example testtest")
+	tc.transactf("ok", `login mjl@mox.example "%s"`, password0)
 
 	tc.transactf("bad", " missingcommand")
 
@@ -503,7 +635,7 @@ func TestScenario(t *testing.T) {
 	tc.transactf("ok", "append inbox (\\seen) {%d+}\r\n%s", len(exampleMsg), exampleMsg)
 	tc.transactf("no", "append bogus () {%d}", len(exampleMsg))
 	tc.cmdf("", "append inbox () {%d}", len(exampleMsg))
-	tc.readprefixline("+")
+	tc.readprefixline("+ ")
 	_, err := tc.conn.Write([]byte(exampleMsg + "\r\n"))
 	tc.check(err, "write message")
 	tc.response("ok")
@@ -521,7 +653,7 @@ func TestScenario(t *testing.T) {
 	tc.transactf("ok", `store 1 flags.silent (\seen \answered)`)
 	tc.transactf("ok", `store 1 -flags.silent (\answered)`)
 	tc.transactf("ok", `store 1 +flags.silent (\answered)`)
-	tc.transactf("no", `store 1 flags (\badflag)`)
+	tc.transactf("bad", `store 1 flags (\badflag)`)
 	tc.transactf("ok", "noop")
 
 	tc.transactf("ok", "copy 1 Trash")
@@ -542,7 +674,7 @@ func TestScenario(t *testing.T) {
 func TestMailbox(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
-	tc.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
 
 	invalid := []string{
 		"e\u0301", // é but as e + acute, not unicode-normalized
@@ -564,13 +696,14 @@ func TestMailbox(t *testing.T) {
 func TestMailboxDeleted(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
-	tc.client.Login("mjl@mox.example", "testtest")
 
 	tc2 := startNoSwitchboard(t)
 	defer tc2.close()
-	tc2.client.Login("mjl@mox.example", "testtest")
 
-	tc.client.Create("testbox")
+	tc.client.Login("mjl@mox.example", password0)
+	tc2.client.Login("mjl@mox.example", password0)
+
+	tc.client.Create("testbox", nil)
 	tc2.client.Select("testbox")
 	tc.client.Delete("testbox")
 
@@ -591,7 +724,7 @@ func TestMailboxDeleted(t *testing.T) {
 
 	tc2.transactf("ok", "unselect")
 
-	tc.client.Create("testbox")
+	tc.client.Create("testbox", nil)
 	tc2.client.Select("testbox")
 	tc.client.Delete("testbox")
 	tc2.transactf("ok", "close")
@@ -600,7 +733,7 @@ func TestMailboxDeleted(t *testing.T) {
 func TestID(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
-	tc.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
 
 	tc.transactf("ok", "id nil")
 	tc.xuntagged(imapclient.UntaggedID{"name": "mox", "version": moxvar.Version})
@@ -614,7 +747,7 @@ func TestID(t *testing.T) {
 func TestSequence(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
-	tc.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
 	tc.client.Select("inbox")
 
 	tc.transactf("bad", "fetch * all") // ../rfc/9051:7018
@@ -623,8 +756,8 @@ func TestSequence(t *testing.T) {
 	tc.transactf("ok", "uid fetch 1 all") // non-existing messages are OK for uids.
 	tc.transactf("ok", "uid fetch * all") // * is like uidnext, a non-existing message.
 
-	tc.client.Append("inbox", nil, nil, []byte(exampleMsg))
-	tc.client.Append("inbox", nil, nil, []byte(exampleMsg))
+	tc.client.Append("inbox", makeAppend(exampleMsg))
+	tc.client.Append("inbox", makeAppend(exampleMsg))
 	tc.transactf("ok", "fetch 2:1,1 uid") // We reorder 2:1 to 1:2, but we don't deduplicate numbers.
 	tc.xuntagged(
 		imapclient.UntaggedFetch{Seq: 1, Attrs: []imapclient.FetchAttr{imapclient.FetchUID(1)}},
@@ -639,16 +772,16 @@ func TestSequence(t *testing.T) {
 // Test that a message that is expunged by another session can be read as long as a
 // reference is held by a session. New sessions do not see the expunged message.
 // todo: possibly implement the additional reference counting. so far it hasn't been worth the trouble.
-func disabledTestReference(t *testing.T) {
+func DisabledTestReference(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
-	tc.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
 	tc.client.Select("inbox")
-	tc.client.Append("inbox", nil, nil, []byte(exampleMsg))
+	tc.client.Append("inbox", makeAppend(exampleMsg))
 
 	tc2 := startNoSwitchboard(t)
 	defer tc2.close()
-	tc2.client.Login("mjl@mox.example", "testtest")
+	tc2.client.Login("mjl@mox.example", password0)
 	tc2.client.Select("inbox")
 
 	tc.client.StoreFlagsSet("1", true, `\Deleted`)
@@ -656,9 +789,9 @@ func disabledTestReference(t *testing.T) {
 
 	tc3 := startNoSwitchboard(t)
 	defer tc3.close()
-	tc3.client.Login("mjl@mox.example", "testtest")
+	tc3.client.Login("mjl@mox.example", password0)
 	tc3.transactf("ok", `list "" "inbox" return (status (messages))`)
-	tc3.xuntagged(imapclient.UntaggedList{Separator: '/', Mailbox: "Inbox"}, imapclient.UntaggedStatus{Mailbox: "Inbox", Attrs: map[string]int64{"MESSAGES": 0}})
+	tc3.xuntagged(imapclient.UntaggedList{Separator: '/', Mailbox: "Inbox"}, imapclient.UntaggedStatus{Mailbox: "Inbox", Attrs: map[imapclient.StatusAttr]int64{imapclient.StatusMessages: 0}})
 
 	tc2.transactf("ok", "fetch 1 rfc822.size")
 	tc.xuntagged(imapclient.UntaggedFetch{Seq: 1, Attrs: []imapclient.FetchAttr{imapclient.FetchRFC822Size(len(exampleMsg))}})

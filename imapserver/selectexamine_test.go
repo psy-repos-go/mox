@@ -21,7 +21,7 @@ func testSelectExamine(t *testing.T, examine bool) {
 	tc := start(t)
 	defer tc.close()
 
-	tc.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
 
 	cmd := "select"
 	okcode := "READ-WRITE"
@@ -32,8 +32,9 @@ func testSelectExamine(t *testing.T, examine bool) {
 
 	uclosed := imapclient.UntaggedResult{Status: imapclient.OK, RespText: imapclient.RespText{Code: "CLOSED", More: "x"}}
 	flags := strings.Split(`\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent`, " ")
+	permflags := strings.Split(`\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent \*`, " ")
 	uflags := imapclient.UntaggedFlags(flags)
-	upermflags := imapclient.UntaggedResult{Status: imapclient.OK, RespText: imapclient.RespText{Code: "PERMANENTFLAGS", CodeArg: imapclient.CodeList{Code: "PERMANENTFLAGS", Args: flags}, More: "x"}}
+	upermflags := imapclient.UntaggedResult{Status: imapclient.OK, RespText: imapclient.RespText{Code: "PERMANENTFLAGS", CodeArg: imapclient.CodeList{Code: "PERMANENTFLAGS", Args: permflags}, More: "x"}}
 	urecent := imapclient.UntaggedRecent(0)
 	uexists0 := imapclient.UntaggedExists(0)
 	uexists1 := imapclient.UntaggedExists(1)
@@ -44,28 +45,28 @@ func testSelectExamine(t *testing.T, examine bool) {
 	uuidnext2 := imapclient.UntaggedResult{Status: imapclient.OK, RespText: imapclient.RespText{Code: "UIDNEXT", CodeArg: imapclient.CodeUint{Code: "UIDNEXT", Num: 2}, More: "x"}}
 
 	// Parameter required.
-	tc.transactf("bad", cmd)
+	tc.transactf("bad", "%s", cmd)
 
 	// Mailbox does not exist.
-	tc.transactf("no", cmd+" bogus")
+	tc.transactf("no", "%s bogus", cmd)
 
-	tc.transactf("ok", cmd+" inbox")
+	tc.transactf("ok", "%s inbox", cmd)
 	tc.xuntagged(uflags, upermflags, urecent, uexists0, uuidval1, uuidnext1, ulist)
 	tc.xcode(okcode)
 
-	tc.transactf("ok", cmd+` "inbox"`)
+	tc.transactf("ok", `%s "inbox"`, cmd)
 	tc.xuntagged(uclosed, uflags, upermflags, urecent, uexists0, uuidval1, uuidnext1, ulist)
 	tc.xcode(okcode)
 
 	// Append a message. It will be reported as UNSEEN.
-	tc.client.Append("inbox", nil, nil, []byte(exampleMsg))
-	tc.transactf("ok", cmd+" inbox")
+	tc.client.Append("inbox", makeAppend(exampleMsg))
+	tc.transactf("ok", "%s inbox", cmd)
 	tc.xuntagged(uclosed, uflags, upermflags, urecent, uunseen, uexists1, uuidval1, uuidnext2, ulist)
 	tc.xcode(okcode)
 
 	// With imap4rev2, we no longer get untagged RECENT or untagged UNSEEN.
 	tc.client.Enable("imap4rev2")
-	tc.transactf("ok", cmd+" inbox")
+	tc.transactf("ok", "%s inbox", cmd)
 	tc.xuntagged(uclosed, uflags, upermflags, uexists1, uuidval1, uuidnext2, ulist)
 	tc.xcode(okcode)
 }

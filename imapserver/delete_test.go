@@ -16,9 +16,9 @@ func TestDelete(t *testing.T) {
 	tc3 := startNoSwitchboard(t)
 	defer tc3.close()
 
-	tc.client.Login("mjl@mox.example", "testtest")
-	tc2.client.Login("mjl@mox.example", "testtest")
-	tc3.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
+	tc2.client.Login("mjl@mox.example", password0)
+	tc3.client.Login("mjl@mox.example", password0)
 
 	tc.transactf("bad", "delete")              // Missing mailbox.
 	tc.transactf("no", "delete inbox")         // Cannot delete inbox.
@@ -28,7 +28,7 @@ func TestDelete(t *testing.T) {
 	tc.client.Subscribe("x")
 	tc.transactf("no", "delete x") // Subscription does not mean there is a mailbox that can be deleted.
 
-	tc.client.Create("a/b")
+	tc.client.Create("a/b", nil)
 	tc2.transactf("ok", "noop") // Drain changes.
 	tc3.transactf("ok", "noop")
 
@@ -53,12 +53,12 @@ func TestDelete(t *testing.T) {
 	)
 
 	// Let's try again with a message present.
-	tc.client.Create("msgs")
-	tc.client.Append("msgs", nil, nil, []byte(exampleMsg))
+	tc.client.Create("msgs", nil)
+	tc.client.Append("msgs", makeAppend(exampleMsg))
 	tc.transactf("ok", "delete msgs")
 
 	// Delete for inbox/* is allowed.
-	tc.client.Create("inbox/a")
+	tc.client.Create("inbox/a", nil)
 	tc.transactf("ok", "delete inbox/a")
 
 }

@@ -1,17 +1,18 @@
 package imapserver
 
 import (
-	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/mjl-/mox/imapclient"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/store"
 )
@@ -58,22 +59,24 @@ func FuzzServer(f *testing.F) {
 		f.Add(tag + cmd)
 	}
 
-	mox.Context = context.Background()
-	mox.ConfigStaticPath = "../testdata/imapserverfuzz/mox.conf"
-	mox.MustLoadConfig(false)
+	log := mlog.New("imapserver", nil)
+	mox.ConfigStaticPath = filepath.FromSlash("../testdata/imapserverfuzz/mox.conf")
+	mox.MustLoadConfig(true, false)
 	dataDir := mox.ConfigDirPath(mox.Conf.Static.DataDir)
 	os.RemoveAll(dataDir)
-	acc, err := store.OpenAccount("mjl")
+	acc, err := store.OpenAccount(log, "mjl", false)
 	if err != nil {
 		f.Fatalf("open account: %v", err)
 	}
-	defer acc.Close()
-	err = acc.SetPassword("testtest")
+	defer func() {
+		acc.Close()
+		acc.CheckClosed()
+	}()
+	err = acc.SetPassword(log, password0)
 	if err != nil {
 		f.Fatalf("set password: %v", err)
 	}
-	done := store.Switchboard()
-	defer close(done)
+	defer store.Switchboard()()
 
 	comm := store.RegisterComm(acc)
 	defer comm.Unregister()
@@ -117,7 +120,7 @@ func FuzzServer(f *testing.F) {
 
 				err := clientConn.SetDeadline(time.Now().Add(time.Second))
 				flog(err, "set client deadline")
-				client, _ := imapclient.New(clientConn, true)
+				client, _ := imapclient.New(mox.Cid(), clientConn, true)
 
 				for _, cmd := range cmds {
 					client.Commandf("", "%s", cmd)
@@ -129,16 +132,16 @@ func FuzzServer(f *testing.F) {
 
 			err = serverConn.SetDeadline(time.Now().Add(time.Second))
 			flog(err, "set server deadline")
-			serve("test", cid, nil, serverConn, false, true)
+			serve("test", cid, nil, serverConn, false, true, false, "")
 			cid++
 		}
 
 		// Each command brings the connection state one step further. We try the fuzzing
 		// input for each state.
 		run([]string{})
-		run([]string{"login mjl@mox.example testtest"})
-		run([]string{"login mjl@mox.example testtest", "select inbox"})
+		run([]string{`login mjl@mox.example "` + password0 + `"`})
+		run([]string{`login mjl@mox.example "` + password0 + `"`, "select inbox"})
 		xappend := fmt.Sprintf("append inbox () {%d+}\r\n%s", len(exampleMsg), exampleMsg)
-		run([]string{"login mjl@mox.example testtest", "select inbox", xappend})
+		run([]string{`login mjl@mox.example "` + password0 + `"`, "select inbox", xappend})
 	})
 }

@@ -15,8 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -24,13 +26,12 @@ import (
 
 	"github.com/mjl-/mox/message"
 	"github.com/mjl-/mox/mlog"
+	"github.com/mjl-/mox/moxvar"
 )
 
 var (
-	xlog = mlog.New("junk")
-
-	errBadContentType = errors.New("bad content-type") // sure sign of spam
-	errClosed         = errors.New("filter is closed")
+	// errBadContentType = errors.New("bad content-type") // sure sign of spam, todo: use this error
+	errClosed = errors.New("filter is closed")
 )
 
 type word struct {
@@ -38,8 +39,8 @@ type word struct {
 	Spam uint32
 }
 
-type wordscore struct {
-	Word string
+type Wordscore struct {
+	Word string `bstore:"typename wordscore"`
 	Ham  uint32
 	Spam uint32
 }
@@ -56,12 +57,12 @@ type Params struct {
 	RareWords   int     `sconf:"optional" sconf-doc:"Occurrences in word database until a word is considered rare and its influence in calculating probability reduced. E.g. 1 or 2."`
 }
 
-var DBTypes = []any{wordscore{}} // Stored in DB.
+var DBTypes = []any{Wordscore{}} // Stored in DB.
 
 type Filter struct {
 	Params
 
-	log               *mlog.Log // For logging cid.
+	log               mlog.Log // For logging cid.
 	closed            bool
 	modified          bool            // Whether any modifications are pending. Cleared by Save.
 	hams, spams       uint32          // Message count, stored in db under word "-".
@@ -111,7 +112,7 @@ func (f *Filter) Close() error {
 	return err
 }
 
-func OpenFilter(ctx context.Context, log *mlog.Log, params Params, dbPath, bloomPath string, loadBloom bool) (*Filter, error) {
+func OpenFilter(ctx context.Context, log mlog.Log, params Params, dbPath, bloomPath string, loadBloom bool) (*Filter, error) {
 	var bloom *Bloom
 	if loadBloom {
 		var err error
@@ -125,7 +126,7 @@ func OpenFilter(ctx context.Context, log *mlog.Log, params Params, dbPath, bloom
 		}
 	}
 
-	db, err := openDB(ctx, dbPath)
+	db, err := openDB(ctx, log, dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %s", err)
 	}
@@ -141,7 +142,7 @@ func OpenFilter(ctx context.Context, log *mlog.Log, params Params, dbPath, bloom
 		bloom:     bloom,
 	}
 	err = f.db.Read(ctx, func(tx *bstore.Tx) error {
-		wc := wordscore{Word: "-"}
+		wc := Wordscore{Word: "-"}
 		err := tx.Get(&wc)
 		f.hams = wc.Ham
 		f.spams = wc.Spam
@@ -159,7 +160,7 @@ func OpenFilter(ctx context.Context, log *mlog.Log, params Params, dbPath, bloom
 // filter is marked as new until the first save, will be done automatically if
 // TrainDirs is called. If the bloom and/or database files exist, an error is
 // returned.
-func NewFilter(ctx context.Context, log *mlog.Log, params Params, dbPath, bloomPath string) (*Filter, error) {
+func NewFilter(ctx context.Context, log mlog.Log, params Params, dbPath, bloomPath string) (*Filter, error) {
 	var err error
 	if _, err := os.Stat(bloomPath); err == nil {
 		return nil, fmt.Errorf("bloom filter already exists on disk: %s", bloomPath)
@@ -219,7 +220,7 @@ func openBloom(path string) (*Bloom, error) {
 	return NewBloom(buf, bloomK)
 }
 
-func newDB(ctx context.Context, log *mlog.Log, path string) (db *bstore.DB, rerr error) {
+func newDB(ctx context.Context, log mlog.Log, path string) (db *bstore.DB, rerr error) {
 	// Remove any existing files.
 	os.Remove(path)
 
@@ -230,18 +231,20 @@ func newDB(ctx context.Context, log *mlog.Log, path string) (db *bstore.DB, rerr
 		}
 	}()
 
-	db, err := bstore.Open(ctx, path, &bstore.Options{Timeout: 5 * time.Second, Perm: 0660}, DBTypes...)
+	opts := bstore.Options{Timeout: 5 * time.Second, Perm: 0660, RegisterLogger: moxvar.RegisterLogger(path, log.Logger)}
+	db, err := bstore.Open(ctx, path, &opts, DBTypes...)
 	if err != nil {
 		return nil, fmt.Errorf("open new database: %w", err)
 	}
 	return db, nil
 }
 
-func openDB(ctx context.Context, path string) (*bstore.DB, error) {
+func openDB(ctx context.Context, log mlog.Log, path string) (*bstore.DB, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("stat db file: %w", err)
 	}
-	return bstore.Open(ctx, path, &bstore.Options{Timeout: 5 * time.Second, Perm: 0660}, DBTypes...)
+	opts := bstore.Options{Timeout: 5 * time.Second, Perm: 0660, RegisterLogger: log.Logger}
+	return bstore.Open(ctx, path, &opts, DBTypes...)
 }
 
 // Save stores modifications, e.g. from training, to the database and bloom
@@ -271,32 +274,43 @@ func (f *Filter) Save() error {
 		return words[i] < words[j]
 	})
 
-	f.log.Debug("inserting words in junkfilter db", mlog.Field("words", len(f.changed)))
+	f.log.Debug("inserting words in junkfilter db", slog.Any("words", len(f.changed)))
 	// start := time.Now()
 	if f.isNew {
-		if err := f.db.HintAppend(true, wordscore{}); err != nil {
+		if err := f.db.HintAppend(true, Wordscore{}); err != nil {
 			f.log.Errorx("hint appendonly", err)
 		} else {
 			defer func() {
-				err := f.db.HintAppend(false, wordscore{})
+				err := f.db.HintAppend(false, Wordscore{})
 				f.log.Check(err, "restoring append hint")
 			}()
 		}
 	}
 	err := f.db.Write(context.Background(), func(tx *bstore.Tx) error {
 		update := func(w string, ham, spam uint32) error {
+			zeroword := w != "-" && ham == 0 && spam == 0
+
 			if f.isNew {
-				return tx.Insert(&wordscore{w, ham, spam})
+				if zeroword {
+					return nil
+				}
+				return tx.Insert(&Wordscore{w, ham, spam})
 			}
 
-			wc := wordscore{w, 0, 0}
+			wc := Wordscore{w, 0, 0}
 			err := tx.Get(&wc)
 			if err == bstore.ErrAbsent {
-				return tx.Insert(&wordscore{w, ham, spam})
+				if zeroword {
+					return nil
+				}
+				return tx.Insert(&Wordscore{w, ham, spam})
 			} else if err != nil {
 				return err
 			}
-			return tx.Update(&wordscore{w, wc.Ham + ham, wc.Spam + spam})
+			if zeroword {
+				return tx.Delete(&Wordscore{w, 0, 0})
+			}
+			return tx.Update(&Wordscore{w, ham, spam})
 		}
 		if err := update("-", f.hams, f.spams); err != nil {
 			return fmt.Errorf("storing total ham/spam message count: %s", err)
@@ -317,7 +331,7 @@ func (f *Filter) Save() error {
 	f.changed = map[string]word{}
 	f.modified = false
 	f.isNew = false
-	// f.log.Info("wrote filter to db", mlog.Field("duration", time.Since(start)))
+	// f.log.Info("wrote filter to db", slog.Any("duration", time.Since(start)))
 	return nil
 }
 
@@ -328,9 +342,11 @@ func loadWords(ctx context.Context, db *bstore.DB, l []string, dst map[string]wo
 
 	err := db.Read(ctx, func(tx *bstore.Tx) error {
 		for _, w := range l {
-			wc := wordscore{Word: w}
+			wc := Wordscore{Word: w}
 			if err := tx.Get(&wc); err == nil {
 				dst[w] = word{wc.Ham, wc.Spam}
+			} else if err != bstore.ErrAbsent {
+				return fmt.Errorf("get word: %v", err)
 			}
 		}
 		return nil
@@ -341,21 +357,23 @@ func loadWords(ctx context.Context, db *bstore.DB, l []string, dst map[string]wo
 	return nil
 }
 
-// ClassifyWords returns the spam probability for the given words, and number of recognized ham and spam words.
-func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (probability float64, nham, nspam int, rerr error) {
-	if f.closed {
-		return 0, 0, 0, errClosed
-	}
+// WordScore is a word with its score as used in classifications, based on
+// (historic) training.
+type WordScore struct {
+	Word  string
+	Score float64 // 0 is ham, 1 is spam.
+}
 
-	type xword struct {
-		Word string
-		R    float64
+// ClassifyWords returns the spam probability for the given words, and number of recognized ham and spam words.
+func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (Result, error) {
+	if f.closed {
+		return Result{}, errClosed
 	}
 
 	var hamHigh float64 = 0
 	var spamLow float64 = 1
-	var topHam []xword
-	var topSpam []xword
+	var topHam []WordScore
+	var topSpam []WordScore
 
 	// Find words that should be in the database.
 	lookupWords := []string{}
@@ -377,20 +395,26 @@ func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (
 		expect[w] = struct{}{}
 	}
 	if len(unknowns) > 0 {
-		f.log.Debug("unknown words in bloom filter, showing max 50", mlog.Field("words", unknowns), mlog.Field("totalunknown", totalUnknown), mlog.Field("totalwords", len(words)))
+		f.log.Debug("unknown words in bloom filter, showing max 50",
+			slog.Any("words", unknowns),
+			slog.Any("totalunknown", totalUnknown),
+			slog.Any("totalwords", len(words)))
 	}
 
 	// Fetch words from database.
 	fetched := map[string]word{}
 	if len(lookupWords) > 0 {
 		if err := loadWords(ctx, f.db, lookupWords, fetched); err != nil {
-			return 0, 0, 0, err
+			return Result{}, err
 		}
 		for w, c := range fetched {
 			delete(expect, w)
 			f.cache[w] = c
 		}
-		f.log.Debug("unknown words in db", mlog.Field("words", expect), mlog.Field("totalunknown", len(expect)), mlog.Field("totalwords", len(words)))
+		f.log.Debug("unknown words in db",
+			slog.Any("words", expect),
+			slog.Any("totalunknown", len(expect)),
+			slog.Any("totalwords", len(words)))
 	}
 
 	for w := range words {
@@ -424,7 +448,7 @@ func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (
 			if len(topHam) >= f.TopWords && r > hamHigh {
 				continue
 			}
-			topHam = append(topHam, xword{w, r})
+			topHam = append(topHam, WordScore{w, r})
 			if r > hamHigh {
 				hamHigh = r
 			}
@@ -432,7 +456,7 @@ func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (
 			if len(topSpam) >= f.TopWords && r < spamLow {
 				continue
 			}
-			topSpam = append(topSpam, xword{w, r})
+			topSpam = append(topSpam, WordScore{w, r})
 			if r < spamLow {
 				spamLow = r
 			}
@@ -441,24 +465,24 @@ func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (
 
 	sort.Slice(topHam, func(i, j int) bool {
 		a, b := topHam[i], topHam[j]
-		if a.R == b.R {
+		if a.Score == b.Score {
 			return len(a.Word) > len(b.Word)
 		}
-		return a.R < b.R
+		return a.Score < b.Score
 	})
 	sort.Slice(topSpam, func(i, j int) bool {
 		a, b := topSpam[i], topSpam[j]
-		if a.R == b.R {
+		if a.Score == b.Score {
 			return len(a.Word) > len(b.Word)
 		}
-		return a.R > b.R
+		return a.Score > b.Score
 	})
 
-	nham = f.TopWords
+	nham := f.TopWords
 	if nham > len(topHam) {
 		nham = len(topHam)
 	}
-	nspam = f.TopWords
+	nspam := f.TopWords
 	if nspam > len(topSpam) {
 		nspam = len(topSpam)
 	}
@@ -467,27 +491,43 @@ func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (
 
 	var eta float64
 	for _, x := range topHam {
-		eta += math.Log(1-x.R) - math.Log(x.R)
+		eta += math.Log(1-x.Score) - math.Log(x.Score)
 	}
 	for _, x := range topSpam {
-		eta += math.Log(1-x.R) - math.Log(x.R)
+		eta += math.Log(1-x.Score) - math.Log(x.Score)
 	}
 
-	f.log.Debug("top words", mlog.Field("hams", topHam), mlog.Field("spams", topSpam))
+	f.log.Debug("top words", slog.Any("hams", topHam), slog.Any("spams", topSpam))
 
 	prob := 1 / (1 + math.Pow(math.E, eta))
-	return prob, len(topHam), len(topSpam), nil
+
+	// We want at least some positive signals, otherwise a few negative signals can
+	// mark incoming messages as spam too easily. If we have no negative signals, more
+	// messages will be classified as ham and accepted. This is fine, the user will
+	// classify it such, and retrain the filter. We mostly want to avoid rejecting too
+	// much when there isn't enough signal.
+	significant := f.hams >= 50
+
+	return Result{prob, significant, words, topHam, topSpam}, nil
+}
+
+// Result is a successful classification, whether positive or negative.
+type Result struct {
+	Probability float64 // Between 0 (ham) and 1 (spam).
+	Significant bool    // If true, enough classified words are available to base decisions on.
+	Words       map[string]struct{}
+	Hams, Spams []WordScore
 }
 
 // ClassifyMessagePath is a convenience wrapper for calling ClassifyMessage on a file.
-func (f *Filter) ClassifyMessagePath(ctx context.Context, path string) (probability float64, words map[string]struct{}, nham, nspam int, rerr error) {
+func (f *Filter) ClassifyMessagePath(ctx context.Context, path string) (Result, error) {
 	if f.closed {
-		return 0, nil, 0, 0, errClosed
+		return Result{}, errClosed
 	}
 
 	mf, err := os.Open(path)
 	if err != nil {
-		return 0, nil, 0, 0, err
+		return Result{}, err
 	}
 	defer func() {
 		err := mf.Close()
@@ -495,33 +535,30 @@ func (f *Filter) ClassifyMessagePath(ctx context.Context, path string) (probabil
 	}()
 	fi, err := mf.Stat()
 	if err != nil {
-		return 0, nil, 0, 0, err
+		return Result{}, err
 	}
 	return f.ClassifyMessageReader(ctx, mf, fi.Size())
 }
 
-func (f *Filter) ClassifyMessageReader(ctx context.Context, mf io.ReaderAt, size int64) (probability float64, words map[string]struct{}, nham, nspam int, rerr error) {
-	m, err := message.EnsurePart(mf, size)
+func (f *Filter) ClassifyMessageReader(ctx context.Context, mf io.ReaderAt, size int64) (Result, error) {
+	m, err := message.EnsurePart(f.log.Logger, false, mf, size)
 	if err != nil && errors.Is(err, message.ErrBadContentType) {
 		// Invalid content-type header is a sure sign of spam.
 		//f.log.Infox("parsing content", err)
-		return 1, nil, 0, 0, nil
+		return Result{Probability: 1, Significant: true}, nil
 	}
 	return f.ClassifyMessage(ctx, m)
 }
 
 // ClassifyMessage parses the mail message in r and returns the spam probability
 // (between 0 and 1), along with the tokenized words found in the message, and the
-// number of recognized ham and spam words.
-func (f *Filter) ClassifyMessage(ctx context.Context, m message.Part) (probability float64, words map[string]struct{}, nham, nspam int, rerr error) {
-	var err error
-	words, err = f.ParseMessage(m)
+// ham and spam words and their scores used.
+func (f *Filter) ClassifyMessage(ctx context.Context, m message.Part) (Result, error) {
+	words, err := f.ParseMessage(m)
 	if err != nil {
-		return 0, nil, 0, 0, err
+		return Result{}, err
 	}
-
-	probability, nham, nspam, err = f.ClassifyWords(ctx, words)
-	return probability, words, nham, nspam, err
+	return f.ClassifyWords(ctx, words)
 }
 
 // Train adds the words of a single message to the filter.
@@ -567,7 +604,7 @@ func (f *Filter) Train(ctx context.Context, ham bool, words map[string]struct{})
 }
 
 func (f *Filter) TrainMessage(ctx context.Context, r io.ReaderAt, size int64, ham bool) error {
-	p, _ := message.EnsurePart(r, size)
+	p, _ := message.EnsurePart(f.log.Logger, false, r, size)
 	words, err := f.ParseMessage(p)
 	if err != nil {
 		return fmt.Errorf("parsing mail contents: %v", err)
@@ -576,7 +613,7 @@ func (f *Filter) TrainMessage(ctx context.Context, r io.ReaderAt, size int64, ha
 }
 
 func (f *Filter) UntrainMessage(ctx context.Context, r io.ReaderAt, size int64, ham bool) error {
-	p, _ := message.EnsurePart(r, size)
+	p, _ := message.EnsurePart(f.log.Logger, false, r, size)
 	words, err := f.ParseMessage(p)
 	if err != nil {
 		return fmt.Errorf("parsing mail contents: %v", err)
@@ -611,10 +648,16 @@ func (f *Filter) Untrain(ctx context.Context, ham bool, words map[string]struct{
 
 	// Modify the message count.
 	f.modified = true
+	var fv *uint32
 	if ham {
-		f.hams--
+		fv = &f.hams
 	} else {
-		f.spams--
+		fv = &f.spams
+	}
+	if *fv == 0 {
+		f.log.Error("attempt to decrease ham/spam message count while already zero", slog.Bool("ham", ham))
+	} else {
+		*fv -= 1
 	}
 
 	// Decrease the word counts.
@@ -623,10 +666,16 @@ func (f *Filter) Untrain(ctx context.Context, ham bool, words map[string]struct{
 		if !ok {
 			continue
 		}
+		var v *uint32
 		if ham {
-			c.Ham--
+			v = &c.Ham
 		} else {
-			c.Spam--
+			v = &c.Spam
+		}
+		if *v == 0 {
+			f.log.Error("attempt to decrease ham/spam word count while already zero", slog.String("word", w), slog.Bool("ham", ham))
+		} else {
+			*v -= 1
 		}
 		f.cache[w] = c
 		f.changed[w] = c
@@ -644,10 +693,10 @@ func (f *Filter) TrainDir(dir string, files []string, ham bool) (n, malformed ui
 	}
 
 	for _, name := range files {
-		p := fmt.Sprintf("%s/%s", dir, name)
+		p := filepath.Join(dir, name)
 		valid, words, err := f.tokenizeMail(p)
 		if err != nil {
-			// f.log.Infox("tokenizing mail", err, mlog.Field("path", p))
+			// f.log.Infox("tokenizing mail", err, slog.Any("path", p))
 			malformed++
 			continue
 		}
@@ -719,21 +768,20 @@ func (f *Filter) TrainDirs(hamDir, sentDir, spamDir string, hamFiles, sentFiles,
 	dbSize := f.fileSize(f.dbPath)
 	bloomSize := f.fileSize(f.bloomPath)
 
-	fields := []mlog.Pair{
-		mlog.Field("hams", hams),
-		mlog.Field("hamtime", tham),
-		mlog.Field("hammalformed", hamMalformed),
-		mlog.Field("sent", sent),
-		mlog.Field("senttime", tsent),
-		mlog.Field("sentmalformed", sentMalformed),
-		mlog.Field("spams", f.spams),
-		mlog.Field("spamtime", tspam),
-		mlog.Field("spammalformed", spamMalformed),
-		mlog.Field("dbsize", fmt.Sprintf("%.1fmb", float64(dbSize)/(1024*1024))),
-		mlog.Field("bloomsize", fmt.Sprintf("%.1fmb", float64(bloomSize)/(1024*1024))),
-		mlog.Field("bloom1ratio", fmt.Sprintf("%.4f", float64(f.bloom.Ones())/float64(len(f.bloom.Bytes())*8))),
-	}
-	xlog.Print("training done", fields...)
+	f.log.Print("training done",
+		slog.Any("hams", hams),
+		slog.Any("hamtime", tham),
+		slog.Any("hammalformed", hamMalformed),
+		slog.Any("sent", sent),
+		slog.Any("senttime", tsent),
+		slog.Any("sentmalformed", sentMalformed),
+		slog.Any("spams", f.spams),
+		slog.Any("spamtime", tspam),
+		slog.Any("spammalformed", spamMalformed),
+		slog.Any("dbsize", fmt.Sprintf("%.1fmb", float64(dbSize)/(1024*1024))),
+		slog.Any("bloomsize", fmt.Sprintf("%.1fmb", float64(bloomSize)/(1024*1024))),
+		slog.Any("bloom1ratio", fmt.Sprintf("%.4f", float64(f.bloom.Ones())/float64(len(f.bloom.Bytes())*8))),
+	)
 
 	return nil
 }
@@ -741,7 +789,7 @@ func (f *Filter) TrainDirs(hamDir, sentDir, spamDir string, hamFiles, sentFiles,
 func (f *Filter) fileSize(p string) int {
 	fi, err := os.Stat(p)
 	if err != nil {
-		f.log.Infox("stat", err, mlog.Field("path", p))
+		f.log.Infox("stat", err, slog.Any("path", p))
 		return 0
 	}
 	return int(fi.Size())

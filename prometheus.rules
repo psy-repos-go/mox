@@ -8,6 +8,11 @@ groups:
     annotations:
       summary: unhandled panic
 
+  - alert: mox-acme-request-cert-errors
+    expr: increase(mox_autotls_cert_request_errors_total[1h]) > 0
+    annotations:
+      summary: errors requesting tls certificates with acme
+
   - alert: mox-ip-on-dns-blocklist
     expr: mox_dnsbl_ips_success < 1
     annotations:
@@ -28,6 +33,12 @@ groups:
     annotations:
       summary: http 5xx responses from webserver
 
+  - alert: mox-queue-hold
+    expr: mox_queue_hold > 0
+    for: 2h
+    annotations:
+      summary: messages on hold in queue for at least two hours
+
   - alert: mox-submission-errors
     expr: increase(mox_smtpserver_submission_total{result=~".*error"}[1h]) > 0
     annotations:
@@ -38,12 +49,32 @@ groups:
     annotations:
       summary: smtp delivery errors
 
+  - alert: mox-webmail-errors
+    expr: increase(mox_webmail_errors_total[1h]) > 0
+    annotations:
+      summary: errors in webmail operation
+
+  - alert: mox-webmailsubmission-errors
+    expr: increase(mox_webmail_submission_total{result=~".*error"}[1h]) > 0
+    annotations:
+      summary: webmail submission errors
+
+  - alert: mox-sherpa-server-errors
+    expr: increase(sherpa_errors_total{api=~"mox.*",code=~"server:.*"}[1h]) > 0
+    annotations:
+      summary: sherpa web api server errors
+
   # the alerts below can be used to keep a closer eye or when starting to use mox,
   # but can be noisy, or you may not be able to prevent them.
 
+  - alert: mox-incoming-delivery-starttls-errors
+    expr: sum by (instance) (increase(mox_smtpserver_delivery_starttls_errors_total[1h])) / sum by (instance) (increase(mox_smtpserver_delivery_starttls_total[1h])) > 0.1
+    annotations:
+      summary: starttls handshake errors for >10% of incoming smtp delivery connections
+
   # change period to match your expected incoming message rate.
   - alert: mox-no-deliveries
-    expr: sum(rate(mox_smtpserver_delivery_total{result="delivered"}[6h])) == 0
+    expr: sum by (instance) (rate(mox_smtpserver_delivery_total{result="delivered"}[6h])) == 0
     annotations:
       summary: no mail delivered for 6 hours
 

@@ -5,22 +5,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mjl-/bstore"
+
 	"github.com/mjl-/mox/imapclient"
+	"github.com/mjl-/mox/store"
 )
 
 func TestFetch(t *testing.T) {
 	tc := start(t)
 	defer tc.close()
 
-	tc.client.Login("mjl@mox.example", "testtest")
+	tc.client.Login("mjl@mox.example", password0)
 	tc.client.Enable("imap4rev2")
 	received, err := time.Parse(time.RFC3339, "2022-11-16T10:01:00+01:00")
 	tc.check(err, "parse time")
-	tc.client.Append("inbox", nil, &received, []byte(exampleMsg))
+	tc.client.Append("inbox", makeAppendTime(exampleMsg, received))
 	tc.client.Select("inbox")
 
 	uid1 := imapclient.FetchUID(1)
-	date1 := imapclient.FetchInternalDate("16-Nov-2022 10:01:00 +0100")
+	date1 := imapclient.FetchInternalDate{Date: received}
 	rfcsize1 := imapclient.FetchRFC822Size(len(exampleMsg))
 	env1 := imapclient.FetchEnvelope{
 		Date:      "Mon, 7 Feb 1994 21:52:25 -0800",
@@ -201,6 +204,27 @@ func TestFetch(t *testing.T) {
 	tc.transactf("ok", "uid fetch 2 body[]")
 	tc.xuntagged()
 
+	// SAVEDATE
+	tc.transactf("ok", "uid fetch 1 savedate")
+	// Fetch exact SaveDate we'll be expecting from server.
+	var saveDate time.Time
+	err = tc.account.DB.Read(ctxbg, func(tx *bstore.Tx) error {
+		inbox, err := tc.account.MailboxFind(tx, "Inbox")
+		tc.check(err, "get inbox")
+		if inbox == nil {
+			t.Fatalf("missing inbox")
+		}
+		m, err := bstore.QueryTx[store.Message](tx).FilterNonzero(store.Message{MailboxID: inbox.ID, UID: store.UID(uid1)}).Get()
+		tc.check(err, "get message")
+		if m.SaveDate == nil {
+			t.Fatalf("zero savedate for message")
+		}
+		saveDate = m.SaveDate.Truncate(time.Second)
+		return nil
+	})
+	tc.check(err, "get savedate")
+	tc.xuntagged(imapclient.UntaggedFetch{Seq: 1, Attrs: []imapclient.FetchAttr{uid1, imapclient.FetchSaveDate{SaveDate: &saveDate}}})
+
 	// Test some invalid syntax.
 	tc.transactf("bad", "fetch")
 	tc.transactf("bad", "fetch ")
@@ -241,6 +265,7 @@ func TestFetch(t *testing.T) {
 						imapclient.BodyTypeBasic{MediaType: "IMAGE", MediaSubtype: "JPEG", BodyFields: imapclient.BodyFields{CTE: "BASE64"}},
 					},
 					MediaSubtype: "PARALLEL",
+					Ext:          &imapclient.BodyExtensionMpart{Params: [][2]string{{"boundary", "unique-boundary-2"}}},
 				},
 				imapclient.BodyTypeText{MediaType: "TEXT", MediaSubtype: "ENRICHED", BodyFields: imapclient.BodyFields{Octets: 145}, Lines: 5},
 				imapclient.BodyTypeMsg{
@@ -260,9 +285,10 @@ func TestFetch(t *testing.T) {
 				},
 			},
 			MediaSubtype: "MIXED",
+			Ext:          &imapclient.BodyExtensionMpart{Params: [][2]string{{"boundary", "unique-boundary-1"}}},
 		},
 	}
-	tc.client.Append("inbox", nil, &received, []byte(nestedMessage))
+	tc.client.Append("inbox", makeAppendTime(nestedMessage, received))
 	tc.transactf("ok", "fetch 2 bodystructure")
 	tc.xuntagged(imapclient.UntaggedFetch{Seq: 2, Attrs: []imapclient.FetchAttr{uid2, bodystructure2}})
 

@@ -6,9 +6,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"hash"
+	"io"
 	"strings"
 	"time"
 
+	"github.com/mjl-/flate"
+
+	"github.com/mjl-/mox/mlog"
+	"github.com/mjl-/mox/moxio"
 	"github.com/mjl-/mox/scram"
 )
 
@@ -39,35 +44,69 @@ func (c *Conn) Starttls(config *tls.Config) (untagged []Untagged, result Result,
 	defer c.recover(&rerr)
 	untagged, result, rerr = c.Transactf("starttls")
 	c.xcheckf(rerr, "starttls command")
-	conn := tls.Client(c.conn, config)
-	err := conn.Handshake()
+
+	conn := c.xprefixConn()
+	tlsConn := tls.Client(conn, config)
+	err := tlsConn.Handshake()
 	c.xcheckf(err, "tls handshake")
-	c.conn = conn
-	c.r = bufio.NewReader(conn)
+	c.conn = tlsConn
 	return untagged, result, nil
 }
 
 // Login authenticates with username and password
 func (c *Conn) Login(username, password string) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
-	return c.Transactf("login %s %s", astring(username), astring(password))
+
+	c.LastTag = c.nextTag()
+	fmt.Fprintf(c.bw, "%s login %s ", c.LastTag, astring(username))
+	defer c.xtrace(mlog.LevelTraceauth)()
+	fmt.Fprintf(c.bw, "%s\r\n", astring(password))
+	c.xtrace(mlog.LevelTrace) // Restore.
+	return c.Response()
 }
 
 // Authenticate with plaintext password using AUTHENTICATE PLAIN.
 func (c *Conn) AuthenticatePlain(username, password string) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
 
-	untagged, result, rerr = c.Transactf("authenticate plain %s", base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "\u0000%s\u0000%s", username, password)))
-	return
+	c.Commandf("", "authenticate plain")
+	_, untagged, result, rerr = c.ReadContinuation()
+	c.xcheckf(rerr, "reading continuation")
+	if result.Status != "" {
+		c.xerrorf("got result status %q, expected continuation", result.Status)
+	}
+	defer c.xtrace(mlog.LevelTraceauth)()
+	xw := base64.NewEncoder(base64.StdEncoding, c.bw)
+	fmt.Fprintf(xw, "\u0000%s\u0000%s", username, password)
+	xw.Close()
+	c.xtrace(mlog.LevelTrace) // Restore.
+	fmt.Fprintf(c.bw, "\r\n")
+	c.xflush()
+	return c.Response()
 }
 
-// Authenticate with SCRAM-SHA-1 or SCRAM-SHA-256, where the password is not
-// exchanged in original plaintext form, but only derived hashes are exchanged by
-// both parties as proof of knowledge of password.
+// todo: implement cram-md5, write its credentials as traceauth.
+
+// Authenticate with SCRAM-SHA-256(-PLUS) or SCRAM-SHA-1(-PLUS). With SCRAM, the
+// password is not exchanged in plaintext form, but only derived hashes are
+// exchanged by both parties as proof of knowledge of password.
+//
+// The PLUS variants bind the authentication exchange to the TLS connection,
+// detecting MitM attacks.
 func (c *Conn) AuthenticateSCRAM(method string, h func() hash.Hash, username, password string) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
 
-	sc := scram.NewClient(h, username, "")
+	var cs *tls.ConnectionState
+	lmethod := strings.ToLower(method)
+	if strings.HasSuffix(lmethod, "-plus") {
+		tlsConn, ok := c.conn.(*tls.Conn)
+		if !ok {
+			c.xerrorf("cannot use scram plus without tls")
+		}
+		xcs := tlsConn.ConnectionState()
+		cs = &xcs
+	}
+	sc := scram.NewClient(h, username, "", false, cs)
 	clientFirst, err := sc.ClientFirst()
 	c.xcheckf(err, "scram clientFirst")
 	c.LastTag = c.nextTag()
@@ -79,7 +118,7 @@ func (c *Conn) AuthenticateSCRAM(method string, h func() hash.Hash, username, pa
 		line, untagged, result, rerr = c.ReadContinuation()
 		c.xcheckf(err, "read continuation")
 		if result.Status != "" {
-			c.xerrorf("unexpected status %q", result.Status)
+			c.xerrorf("got result status %q, expected continuation", result.Status)
 		}
 		buf, err := base64.StdEncoding.DecodeString(line)
 		c.xcheckf(err, "parsing base64 from remote")
@@ -101,6 +140,39 @@ func (c *Conn) AuthenticateSCRAM(method string, h func() hash.Hash, username, pa
 	c.xcheckf(err, "scram client end")
 
 	return c.ResponseOK()
+}
+
+// CompressDeflate enables compression with deflate on the connection.
+//
+// Only possible when server has announced the COMPRESS=DEFLATE capability.
+//
+// State: Authenticated or selected.
+func (c *Conn) CompressDeflate() (untagged []Untagged, result Result, rerr error) {
+	defer c.recover(&rerr)
+
+	if _, ok := c.CapAvailable[CapCompressDeflate]; !ok {
+		c.xerrorf("server does not implement capability %s", CapCompressDeflate)
+	}
+
+	untagged, result, rerr = c.Transactf("compress deflate")
+	c.xcheck(rerr)
+
+	c.flateBW = bufio.NewWriter(c)
+	fw0, err := flate.NewWriter(c.flateBW, flate.DefaultCompression)
+	c.xcheckf(err, "deflate") // Cannot happen.
+	fw := moxio.NewFlateWriter(fw0)
+
+	c.compress = true
+	c.flateWriter = fw
+	c.tw = moxio.NewTraceWriter(mlog.New("imapclient", nil), "CW: ", fw)
+	c.bw = bufio.NewWriter(c.tw)
+
+	rc := c.xprefixConn()
+	fr := flate.NewReaderPartial(rc)
+	c.tr = moxio.NewTraceReader(mlog.New("imapclient", nil), "CR: ", fr)
+	c.br = bufio.NewReader(c.tr)
+
+	return
 }
 
 // Enable enables capabilities for use with the connection, verifying the server has indeed enabled them.
@@ -136,9 +208,18 @@ func (c *Conn) Examine(mailbox string) (untagged []Untagged, result Result, rerr
 }
 
 // Create makes a new mailbox on the server.
-func (c *Conn) Create(mailbox string) (untagged []Untagged, result Result, rerr error) {
+// SpecialUse can only be used on servers that announced the CREATE-SPECIAL-USE
+// capability. Specify flags like \Archive, \Drafts, \Junk, \Sent, \Trash, \All.
+func (c *Conn) Create(mailbox string, specialUse []string) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
-	return c.Transactf("create %s", astring(mailbox))
+	if _, ok := c.CapAvailable[CapCreateSpecialUse]; !ok && len(specialUse) > 0 {
+		c.xerrorf("server does not implement create-special-use extension")
+	}
+	var useStr string
+	if len(specialUse) > 0 {
+		useStr = fmt.Sprintf(" USE (%s)", strings.Join(specialUse, " "))
+	}
+	return c.Transactf("create %s%s", astring(mailbox), useStr)
 }
 
 // Delete removes an entire mailbox and its messages.
@@ -193,20 +274,62 @@ func (c *Conn) Namespace() (untagged []Untagged, result Result, rerr error) {
 	return c.Transactf("namespace")
 }
 
-// Status requests information about a mailbox, such as number of messages, size, etc.
-func (c *Conn) Status(mailbox string) (untagged []Untagged, result Result, rerr error) {
+// Status requests information about a mailbox, such as number of messages, size,
+// etc. At least one attribute required.
+func (c *Conn) Status(mailbox string, attrs ...StatusAttr) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
-	return c.Transactf("status %s", astring(mailbox))
+	l := make([]string, len(attrs))
+	for i, a := range attrs {
+		l[i] = string(a)
+	}
+	return c.Transactf("status %s (%s)", astring(mailbox), strings.Join(l, " "))
+}
+
+// Append represents a parameter to the APPEND or REPLACE commands.
+type Append struct {
+	Flags    []string
+	Received *time.Time
+	Size     int64
+	Data     io.Reader // Must return Size bytes.
 }
 
 // Append adds message to mailbox with flags and optional receive time.
-func (c *Conn) Append(mailbox string, flags []string, received *time.Time, message []byte) (untagged []Untagged, result Result, rerr error) {
+//
+// Multiple messages are only possible when the server has announced the
+// MULTIAPPEND capability.
+func (c *Conn) Append(mailbox string, message Append, more ...Append) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
-	var date string
-	if received != nil {
-		date = ` "` + received.Format("_2-Jan-2006 15:04:05 -0700") + `"`
+
+	if _, ok := c.CapAvailable[CapMultiAppend]; !ok && len(more) > 0 {
+		c.xerrorf("can only append multiple messages when server has announced MULTIAPPEND capability")
 	}
-	return c.Transactf("append %s (%s)%s {%d+}\r\n%s", astring(mailbox), strings.Join(flags, " "), date, len(message), message)
+
+	tag := c.nextTag()
+	c.LastTag = tag
+
+	_, err := fmt.Fprintf(c.bw, "%s append %s", tag, astring(mailbox))
+	c.xcheckf(err, "write command")
+
+	msgs := append([]Append{message}, more...)
+	for _, m := range msgs {
+		var date string
+		if m.Received != nil {
+			date = ` "` + m.Received.Format("_2-Jan-2006 15:04:05 -0700") + `"`
+		}
+
+		// todo: use literal8 if needed, with "UTF8()" if required.
+		// todo: for larger messages, use a synchronizing literal.
+
+		fmt.Fprintf(c.bw, " (%s)%s {%d+}\r\n", strings.Join(m.Flags, " "), date, m.Size)
+		defer c.xtrace(mlog.LevelTracedata)()
+		_, err := io.Copy(c.bw, m.Data)
+		c.xcheckf(err, "write message data")
+		c.xtrace(mlog.LevelTrace) // Restore
+	}
+
+	fmt.Fprintf(c.bw, "\r\n")
+	c.xflush()
+	return c.Response()
 }
 
 // note: No idle command. Idle is better implemented by writing the request and reading and handling the responses as they come in.
@@ -290,4 +413,47 @@ func (c *Conn) Move(seqSet NumSet, dstMailbox string) (untagged []Untagged, resu
 func (c *Conn) UIDMove(uidSet NumSet, dstMailbox string) (untagged []Untagged, result Result, rerr error) {
 	defer c.recover(&rerr)
 	return c.Transactf("uid move %s %s", uidSet.String(), astring(dstMailbox))
+}
+
+// Replace replaces a message from the currently selected mailbox with a
+// new/different version of the message in the named mailbox, which may be the
+// same or different than the currently selected mailbox.
+//
+// Num is a message sequence number. "*" references the last message.
+//
+// Servers must have announced the REPLACE capability.
+func (c *Conn) Replace(msgseq string, mailbox string, msg Append) (untagged []Untagged, result Result, rerr error) {
+	// todo: parse msgseq, must be nznumber, with a known msgseq. or "*" with at least one message.
+	return c.replace("replace", msgseq, mailbox, msg)
+}
+
+// UIDReplace is like Replace, but operates on a UID instead of message
+// sequence number.
+func (c *Conn) UIDReplace(uid string, mailbox string, msg Append) (untagged []Untagged, result Result, rerr error) {
+	// todo: parse uid, must be nznumber, with a known uid. or "*" with at least one message.
+	return c.replace("uid replace", uid, mailbox, msg)
+}
+
+func (c *Conn) replace(cmd string, num string, mailbox string, msg Append) (untagged []Untagged, result Result, rerr error) {
+	defer c.recover(&rerr)
+
+	// todo: use synchronizing literal for larger messages.
+
+	var date string
+	if msg.Received != nil {
+		date = ` "` + msg.Received.Format("_2-Jan-2006 15:04:05 -0700") + `"`
+	}
+	// todo: only use literal8 if needed, possibly with "UTF8()"
+	// todo: encode mailbox
+	c.Commandf("", "%s %s %s (%s)%s ~{%d+}", cmd, num, astring(mailbox), strings.Join(msg.Flags, " "), date, msg.Size)
+
+	defer c.xtrace(mlog.LevelTracedata)()
+	_, err := io.Copy(c.bw, msg.Data)
+	c.xcheckf(err, "write message data")
+	c.xtrace(mlog.LevelTrace)
+
+	fmt.Fprintf(c.bw, "\r\n")
+	c.xflush()
+
+	return c.Response()
 }
